@@ -1,48 +1,125 @@
 rules_version = '2';
+
+// Book Review Community Platform — Firestore access contracts.
+// Every write path validates both ownership and the shape of the incoming document.
 service cloud.firestore {
   match /databases/{database}/documents {
     function isAuthenticated() {
       return request.auth != null;
     }
+
     function isOwner(userId) {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
+    // Ratings are constrained to 0.5 - 5.0 in exact half-star increments.
+    function isRatingValue(value) {
+      return value is number
+        && value >= 0.5
+        && value <= 5.0
+        && math.floor(value * 2) == value * 2;
+    }
+
+    function isShelfStatus(value) {
+      return value in ['want-to-read', 'currently-reading', 'read', 'did-not-finish'];
+    }
+
+    // ---------------------------------------------------------------------
+    // Public reader profiles. Readable by anyone, writable only by the owner.
+    // ---------------------------------------------------------------------
     match /users/{userId} {
       allow read: if true;
-      allow write: if isOwner(userId);
+      allow create: if isOwner(userId) && request.resource.data.uid == userId;
+      allow update: if isOwner(userId)
+        && request.resource.data.uid == userId
+        && request.resource.data.handle is string
+        && request.resource.data.displayName is string;
+      allow delete: if false;
     }
 
+    // ---------------------------------------------------------------------
+    // Catalog documents. Aggregates (averageRating, ratingsCount, bayesianRating)
+    // are written by authenticated transactional rating pipelines.
+    // ---------------------------------------------------------------------
     match /books/{bookId} {
       allow read: if true;
-      allow write: if isAuthenticated();
+      allow create: if isAuthenticated()
+        && request.resource.data.title is string
+        && request.resource.data.pageCount is number
+        && request.resource.data.ratingsCount is number
+        && request.resource.data.ratingDistribution is map;
+      allow update: if isAuthenticated()
+        && request.resource.data.title is string
+        && request.resource.data.pageCount is number;
+      allow delete: if false;
     }
 
+    // ---------------------------------------------------------------------
+    // Personal shelves. Compound id contract: `${uid}_${bookId}`.
+    // ---------------------------------------------------------------------
     match /userShelves/{shelfId} {
       allow read: if true;
-      allow create, update: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
-      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create, update: if isOwner(request.resource.data.userId)
+        && request.resource.data.id == shelfId
+        && request.resource.data.status is string
+        && isShelfStatus(request.resource.data.status)
+        && request.resource.data.rating is number
+        && request.resource.data.progressPages is number
+        && request.resource.data.progressPercentage is number
+        && request.resource.data.progressPercentage >= 0
+        && request.resource.data.progressPercentage <= 100;
+      allow delete: if isOwner(resource.data.userId);
     }
 
+    // ---------------------------------------------------------------------
+    // Reviews. One deterministic review per (user, book) pair.
+    // ---------------------------------------------------------------------
     match /reviews/{reviewId} {
       allow read: if true;
       allow create: if isAuthenticated()
         && request.resource.data.userId == request.auth.uid
         && reviewId == request.auth.uid + '_' + request.resource.data.bookId
-        && !exists(/databases/$(database)/documents/reviews/$(reviewId));
-      allow update: if isAuthenticated() && resource.data.userId == request.auth.uid;
+        && !exists(/databases/$(database)/documents/reviews/$(reviewId))
+        && isRatingValue(request.resource.data.rating)
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 2
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.content is string
+        && request.resource.data.content.size() >= 20
+        && request.resource.data.content.size() <= 10000
+        && request.resource.data.containsSpoilers is bool;
+      allow update: if isAuthenticated()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.bookId == resource.data.bookId
+        && isRatingValue(request.resource.data.rating)
+        && request.resource.data.title is string
+        && request.resource.data.content is string;
       allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
 
       match /comments/{commentId} {
         allow read: if true;
-        allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+        allow create: if isAuthenticated()
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.reviewId == reviewId
+          && request.resource.data.content is string
+          && request.resource.data.content.size() > 0
+          && request.resource.data.content.size() <= 2000;
+        allow update: if isAuthenticated() && resource.data.userId == request.auth.uid;
         allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
       }
     }
 
+    // ---------------------------------------------------------------------
+    // Review likes. Compound id contract: `${reviewId}_${uid}`.
+    // ---------------------------------------------------------------------
     match /reviewLikes/{likeId} {
       allow read: if true;
-      allow create, delete: if isAuthenticated() && request.auth.uid == request.resource.data.userId;
+      allow create: if isAuthenticated()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.reviewId is string
+        && likeId == request.resource.data.reviewId + '_' + request.auth.uid;
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
     }
   }
 }

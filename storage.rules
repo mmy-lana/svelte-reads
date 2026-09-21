@@ -1,0 +1,31 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    function isImageUnder(maxBytes) {
+      return request.resource.size <= maxBytes
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    // Public book covers, writable by authenticated catalog maintainers.
+    match /book-covers/{bookId}/{fileName} {
+      allow read: if true;
+      allow write: if isAuthenticated() && isImageUnder(5 * 1024 * 1024);
+      allow delete: if isAuthenticated();
+    }
+
+    // User avatars: world readable, owner writable.
+    match /avatars/{userId}/{fileName} {
+      allow read: if true;
+      allow write: if isOwner(userId) && isImageUnder(2 * 1024 * 1024);
+      allow delete: if isOwner(userId);
+    }
+
+    // Everything else is denied by default in Firebase Storage rules.
+  }
+}

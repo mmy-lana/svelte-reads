@@ -10,3 +10,6 @@ pnpm-debug.log*
 firebase-debug.log*
 firestore-debug.log*
 .DS_Store
+repomix-output.xml
+.pnpm-store
+coverage

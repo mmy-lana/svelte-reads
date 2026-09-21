@@ -3,18 +3,28 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.emulator
+      args:
+        # "latest" keeps the emulator on the newest firebase-tools release; pin a version for CI reproducibility.
+        FIREBASE_TOOLS_VERSION: latest
+        GCP_PROJECT: book-review-community-dev
+    image: bookreview-firebase-emulator:local
     container_name: bookreview-firebase-emulator
     restart: unless-stopped
     ports:
-      - "4000:4000"
-      - "8080:8080"
-      - "9099:9099"
-      - "9199:9199"
+      - "4000:4000" # Emulator UI hub
+      - "8080:8080" # Firestore
+      - "9099:9099" # Authentication
+      - "9199:9199" # Cloud Storage
     environment:
       - GCP_PROJECT=book-review-community-dev
+      # Keeps the emulator suite running without an interactive terminal.
+      - CI=true
     volumes:
       - ./firebase.json:/opt/workspace/firebase.json:ro
+      - ./.firebaserc:/opt/workspace/.firebaserc:ro
       - ./firestore.rules:/opt/workspace/firestore.rules:ro
+      - ./firestore.indexes.json:/opt/workspace/firestore.indexes.json:ro
+      - ./storage.rules:/opt/workspace/storage.rules:ro
       - emulator-cache:/root/.cache
     networks:
       - app-net
