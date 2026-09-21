@@ -76,7 +76,7 @@
   ];
 
   async function handleShelfChange(book: Book, status: ShelfStatus) {
-    await shelfStore.setShelfStatus(book, status);
+    await shelfStore.setStatus(book, status);
   }
 </script>
 
@@ -100,7 +100,7 @@
 
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
       {#each sampleBooks as book (book.id)}
-        {@const currentShelf = shelfStore.getShelfForBook(book.id)?.status}
+        {@const currentShelf = shelfStore.statusFor(book.id)}
         <BookCardClean
           {book}
           {currentShelf}

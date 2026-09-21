@@ -1,9 +1,11 @@
 import { fileURLToPath } from 'node:url';
+import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vitest/config';
 
 const srcDir = fileURLToPath(new URL('./src', import.meta.url));
 
 export default defineConfig({
+  plugins: [svelte()],
   resolve: {
     alias: {
       $lib: `${srcDir}/lib`

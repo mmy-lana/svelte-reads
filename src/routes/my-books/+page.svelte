@@ -4,7 +4,7 @@
 
   let activeTab = $state<ShelfStatus | 'all'>('all');
 
-  const shelves = $derived(Array.from(shelfStore.shelvedBooks.values()));
+  const shelves = $derived(Array.from(shelfStore.shelves.values()));
 
   const filteredShelves = $derived(
     activeTab === 'all' ? shelves : shelves.filter((s) => s.status === activeTab)

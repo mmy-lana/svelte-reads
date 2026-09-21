@@ -5,6 +5,7 @@
   import ShelfSelector from '$lib/components/molecules/ShelfSelector.svelte';
   import SpoilerGuard from '$lib/components/molecules/SpoilerGuard.svelte';
   import { shelfStore } from '$lib/state/shelf.svelte';
+  import { reviewStore } from '$lib/state/review.svelte';
   import { authState } from '$lib/state/auth.svelte';
 
   const bookId = $derived(page.params.id || '9780143127741');
@@ -55,7 +56,7 @@
     }
   ]);
 
-  const userShelf = $derived(shelfStore.getShelfForBook(bookData.id));
+  const userShelf = $derived(shelfStore.shelfFor(bookData.id));
   let isWritingReview = $state(false);
   let reviewTitle = $state('');
   let reviewContent = $state('');
@@ -64,7 +65,7 @@
   let isSubmitting = $state(false);
 
   async function handleShelfChange(status: ShelfStatus) {
-    await shelfStore.setShelfStatus(bookData, status);
+    await shelfStore.setStatus(bookData, status);
   }
 
   async function handleRatingChange(rating: number) {
@@ -75,7 +76,12 @@
     if (!authState.user) return;
     isSubmitting = true;
     try {
-      await shelfStore.createReview(bookData, reviewRating, reviewTitle, reviewContent, reviewSpoiler);
+      await reviewStore.createReview(bookData, {
+        rating: reviewRating,
+        title: reviewTitle,
+        content: reviewContent,
+        containsSpoilers: reviewSpoiler
+      });
       reviews = [
         {
           id: `${authState.user.uid}_${bookData.id}`,

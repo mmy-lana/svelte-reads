@@ -14,13 +14,13 @@
 
   onMount(() => {
     if (authState.user) {
-      shelfStore.loadUserShelves();
+      shelfStore.loadShelves({ refresh: true });
     }
   });
 
   $effect(() => {
     if (authState.user) {
-      shelfStore.loadUserShelves();
+      shelfStore.loadShelves({ refresh: true });
     }
   });
 </script>
