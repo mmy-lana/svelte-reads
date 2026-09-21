@@ -33,6 +33,7 @@ import {
   getDoc,
   getFirestore,
   setDoc,
+  updateDoc,
   type Firestore
 } from 'firebase/firestore';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -330,7 +331,9 @@ describe('review pipeline on the emulator', () => {
     const book = await readBook();
     const profile = await readProfile(readerTwo.uid);
     expect(book.reviewsCount).toBe(1);
-    expect(profile.stats.reviewsCount).toBe(1);
+    // SEC-02: profile statistics are server-owned, so a client review write
+    // must never move `stats.reviewsCount`.
+    expect(profile.stats.reviewsCount).toBe(0);
 
     await expect(reviewGateway.createReview(reviewDocument())).rejects.toBeInstanceOf(
       DuplicateReviewError
@@ -339,7 +342,56 @@ describe('review pipeline on the emulator', () => {
     const afterwards = await readBook();
     const profileAfterwards = await readProfile(readerTwo.uid);
     expect(afterwards.reviewsCount).toBe(1);
-    expect(profileAfterwards.stats.reviewsCount).toBe(1);
+    expect(profileAfterwards.stats.reviewsCount).toBe(0);
+  });
+
+  it('denies client writes to profile statistics', async () => {
+    await signIn(readerTwo);
+    const profileRef = doc(db, USER_COLLECTION, readerTwo.uid);
+
+    await expect(updateDoc(profileRef, { 'stats.reviewsCount': 25 })).rejects.toMatchObject({
+      code: 'permission-denied'
+    });
+    await expect(
+      updateDoc(profileRef, {
+        stats: { reviewsCount: 25, ratingsCount: 25, booksReadCount: 25, pagesReadTotal: 25 }
+      })
+    ).rejects.toMatchObject({ code: 'permission-denied' });
+    await expect(updateDoc(profileRef, { 'stats.pagesReadTotal': 999_999 })).rejects.toMatchObject({
+      code: 'permission-denied'
+    });
+
+    // Profile presentation fields stay writable for the owner.
+    await expect(
+      updateDoc(profileRef, { displayName: 'Reader Two Updated', bio: 'Still reading.' })
+    ).resolves.toBeUndefined();
+
+    const profile = await readProfile(readerTwo.uid);
+    expect(profile.stats.reviewsCount).toBe(0);
+    expect(profile.displayName).toBe('Reader Two Updated');
+  });
+
+  it('denies client attempts to rewrite catalog metadata', async () => {
+    await signIn(readerTwo);
+    const bookRef = doc(db, BOOK_COLLECTION, bookId);
+
+    await expect(
+      updateDoc(bookRef, { title: 'Hijacked Edition', authors: ['Attacker'], pageCount: 1 })
+    ).rejects.toMatchObject({ code: 'permission-denied' });
+    await expect(updateDoc(bookRef, { isbn13: '9780743273565' })).rejects.toMatchObject({
+      code: 'permission-denied'
+    });
+    // A tampered aggregate cannot smuggle a metadata change alongside it.
+    await expect(
+      updateDoc(bookRef, { title: 'Hijacked Edition', ratingsCount: 99 })
+    ).rejects.toMatchObject({ code: 'permission-denied' });
+    // Deleting catalog entries is reserved for trusted backends.
+    await expect(deleteDoc(bookRef)).rejects.toMatchObject({ code: 'permission-denied' });
+
+    const book = await readBook();
+    expect(book.title).toBe('Pipeline Test Edition');
+    expect(book.authors).toEqual(['Test Author']);
+    expect(book.isbn13).toBe('9780140187394');
   });
 
   it('reads the review back through the paginated feed', async () => {
@@ -365,7 +417,7 @@ describe('review pipeline on the emulator', () => {
     expect(aggregates.ratingDistribution[2]).toBe(1);
   });
 
-  it('decrements both counters when the review is deleted', async () => {
+  it('decrements the catalog counter and leaves profile stats untouched on delete', async () => {
     await reviewGateway.deleteReview(`${readerTwo.uid}_${bookId}`);
 
     const book = await readBook();

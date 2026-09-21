@@ -235,3 +235,54 @@ describe('rating helpers', () => {
     expect(bayesianFromDistribution({ 1: 25, 2: 0, 3: 0, 4: 0, 5: 0 })).toBe(2.38);
   });
 });
+
+// DEF-02: binary doubles cannot represent most decimal midpoints exactly, so a
+// naive `Math.round(value * 100)` truncates them downward.
+describe('roundToTwoDecimals IEEE-754 boundaries (DEF-02)', () => {
+  it('rounds midpoint decimals half-up', () => {
+    expect(roundToTwoDecimals(1.005)).toBe(1.01);
+    expect(roundToTwoDecimals(1.015)).toBe(1.02);
+    expect(roundToTwoDecimals(2.675)).toBe(2.68);
+    expect(roundToTwoDecimals(0.615)).toBe(0.62);
+    expect(roundToTwoDecimals(10.235)).toBe(10.24);
+    expect(roundToTwoDecimals(1.045)).toBe(1.05);
+  });
+
+  it('documents the precision defect the epsilon adjustment removes', () => {
+    // `1.005 * 100 === 100.49999999999999`, the exact truncation DEF-02 fixes.
+    expect(1.005 * 100).toBeLessThan(100.5);
+    expect(Math.round(1.005 * 100) / 100).toBe(1);
+    expect(roundToTwoDecimals(1.005)).not.toBe(Math.round(1.005 * 100) / 100);
+  });
+
+  it('leaves genuine near-misses untouched', () => {
+    expect(roundToTwoDecimals(1.0049999999)).toBe(1);
+    expect(roundToTwoDecimals(1.0149999)).toBe(1.01);
+    expect(roundToTwoDecimals(0.004)).toBe(0);
+    expect(roundToTwoDecimals(0.006)).toBe(0.01);
+  });
+
+  it('keeps exact two-decimal values stable', () => {
+    for (const value of [0, 0.5, 1, 2.5, 3.75, 4, 4.25, 4.35, 5]) {
+      expect(roundToTwoDecimals(value)).toBe(value);
+    }
+  });
+
+  it('stays inside the rating domain for midpoint aggregates', () => {
+    expect(roundToTwoDecimals(4.999)).toBe(5);
+    expect(roundToTwoDecimals(-1.005)).toBe(-1);
+    expect(roundToTwoDecimals(Number.POSITIVE_INFINITY)).toBe(0);
+    expect(roundToTwoDecimals(Number.NEGATIVE_INFINITY)).toBe(0);
+  });
+
+  it('rounds the Bayesian midpoint without drifting a cent below', () => {
+    // v = 1, m = 199: (1 / 200) * 5 + (199 / 200) * 3.75 = 3.75625 -> 3.76
+    expect(calculateBayesianRating(1, 5, 199)).toBe(3.76);
+    // The weighted sum is rounded on the raw product, so a midpoint aggregate
+    // must survive the same half-up treatment the naive multiply cannot give:
+    // `Math.round(1.005 * 100) / 100` is exactly the truncated 1 DEF-02 fixed.
+    expect(Math.round(1.005 * 100) / 100).toBe(1);
+    expect(roundToTwoDecimals(calculateBayesianRating(1, 1.005, 0))).toBe(1.01);
+    expect(roundToTwoDecimals(distributionAverage({ 1: 6, 2: 0, 3: 0, 4: 0, 5: 0 }))).toBe(1);
+  });
+});

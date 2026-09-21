@@ -32,6 +32,12 @@ export const ValidationRules = {
     },
     bio: {
       maxLength: 500
+    },
+    website: {
+      maxLength: 300
+    },
+    avatarUrl: {
+      maxLength: 2048
     }
   },
   book: {
@@ -102,6 +108,34 @@ export const isoDateStringSchema = z
     'Must be a valid ISO 8601 date string.'
   );
 
+/**
+ * SEC-05: profile links are rendered straight into `href` / `src` attributes, so
+ * the protocol scheme is an injection boundary. `javascript:`, `data:`, and
+ * `vbscript:` URLs are stored XSS vectors and must never reach the profile
+ * document; only explicit `http://` and `https://` URLs (or the empty string
+ * used by freshly created profiles) are accepted.
+ */
+export const HTTP_URL_SCHEME_REGEX = /^https?:\/\/[^\s]+$/i;
+
+const SECURE_URL_PROTOCOL_MESSAGE =
+  'Must be a valid URL starting with http:// or https://.';
+
+/**
+ * Leading/trailing whitespace is a classic scheme-smuggling envelope
+ * (`"\tjavascript:alert(1)"`), so it is stripped before the scheme test — the
+ * exact way a browser trims an `href` before resolving it.
+ */
+function secureUrlSchema(maxLength: number): z.ZodType<string> {
+  return z
+    .string()
+    .trim()
+    .max(maxLength, `Must be ${maxLength} characters or fewer.`)
+    .refine(
+      (value) => value === '' || HTTP_URL_SCHEME_REGEX.test(value),
+      SECURE_URL_PROTOCOL_MESSAGE
+    );
+}
+
 export const userProfileSchema: z.ZodType<UserProfile> = z.object({
   uid: z.string().min(1),
   email: z.email('Must be a valid email address.'),
@@ -110,10 +144,10 @@ export const userProfileSchema: z.ZodType<UserProfile> = z.object({
     .min(ValidationRules.user.displayName.minLength, 'Display name is too short.')
     .max(ValidationRules.user.displayName.maxLength, 'Display name is too long.'),
   handle: z.string().regex(ValidationRules.user.handle.regex, ValidationRules.user.handle.message),
-  avatarUrl: z.string(),
+  avatarUrl: secureUrlSchema(ValidationRules.user.avatarUrl.maxLength),
   bio: z.string().max(ValidationRules.user.bio.maxLength, 'Bio must be 500 characters or fewer.'),
   location: z.string().max(120),
-  website: z.string().max(300),
+  website: secureUrlSchema(ValidationRules.user.website.maxLength),
   readingGoal: z.object({
     year: z.number().int().min(1900).max(9999),
     targetBooks: z.number().int().min(0).max(10000),

@@ -59,10 +59,20 @@ export function calculateBayesianRating(
   return roundToTwoDecimals(weightedRating);
 }
 
-/** Rounds to the two decimal places persisted in Firestore aggregates. */
+/**
+ * Rounds to the two decimal places persisted in Firestore aggregates.
+ *
+ * IEEE-754 binary doubles cannot represent most decimal midpoints exactly
+ * (`1.005 * 100` is `100.49999999999998579`), so a naive `Math.round` truncates
+ * the boundary case downward and a stored average drifts one cent below the
+ * value the pipeline computed. Seeding the product with `Number.EPSILON`
+ * restores the intended half-up result (`1.005 -> 1.01`) while leaving ordinary
+ * values — including explicit near-misses such as `1.0049999999` — untouched,
+ * because the correction is orders of magnitude below the rounding resolution.
+ */
 export function roundToTwoDecimals(value: number): number {
   if (!Number.isFinite(value)) return 0;
-  return Math.round(value * 100) / 100;
+  return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
 /**

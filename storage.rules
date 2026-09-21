@@ -7,22 +7,28 @@ service firebase.storage {
     function isOwner(userId) {
       return isAuthenticated() && request.auth.uid == userId;
     }
+
+    // Upload guard: a real image payload under the bucket ceiling.
     function isImageUnder(maxBytes) {
-      return request.resource.size <= maxBytes
-        && request.resource.contentType.matches('image/.*');
+      return request.resource.contentType.matches('image/.*')
+        && request.resource.size <= maxBytes;
     }
 
     // Public book covers, writable by authenticated catalog maintainers.
+    //
+    // SEC-03: covers are shared catalog assets, so clients may create and
+    // replace them but never delete them — destructive removal stays with the
+    // trusted admin/Cloud Function path. Uploads must be images under 5 MB.
     match /book-covers/{bookId}/{fileName} {
       allow read: if true;
-      allow write: if isAuthenticated() && isImageUnder(5 * 1024 * 1024);
-      allow delete: if isAuthenticated();
+      allow create, update: if isAuthenticated() && isImageUnder(5 * 1024 * 1024);
+      allow delete: if false;
     }
 
     // User avatars: world readable, owner writable.
     match /avatars/{userId}/{fileName} {
       allow read: if true;
-      allow write: if isOwner(userId) && isImageUnder(2 * 1024 * 1024);
+      allow create, update: if isOwner(userId) && isImageUnder(2 * 1024 * 1024);
       allow delete: if isOwner(userId);
     }
 

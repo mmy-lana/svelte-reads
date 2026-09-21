@@ -2,6 +2,15 @@ rules_version = '2';
 
 // Book Review Community Platform — Firestore access contracts.
 // Every write path validates both ownership and the shape of the incoming document.
+//
+// Phase 1 hardening contract:
+//   SEC-01 — /books metadata is immutable on update; only the aggregate keys
+//            (plus updatedAt) may move, and every aggregate is range-checked.
+//   SEC-02 — /users profile edits and statistics are disjoint: stats are written
+//            only by server-side/admin paths, never by the owning client.
+//   SEC-04 — /reviews engagement counters are author-immutable and may only be
+//            moved by exactly one step while the acting reader adds or removes
+//            their own /reviewLikes row.
 service cloud.firestore {
   match /databases/{database}/documents {
     function isAuthenticated() {
@@ -24,33 +33,106 @@ service cloud.firestore {
       return value in ['want-to-read', 'currently-reading', 'read', 'did-not-finish'];
     }
 
+    // A stored average, Bayesian score, or shelf rating lives inside 0 - 5.
+    function isRatingScore(value) {
+      return value is number && value >= 0 && value <= 5;
+    }
+
+    // Counters are non-negative whole numbers.
+    function isCount(value) {
+      return value is number && value >= 0 && math.floor(value) == value;
+    }
+
+    // The exact histogram shape persisted by the rating pipeline: tiers 1 - 5.
+    function isRatingDistribution(value) {
+      return value is map
+        && value.keys().hasOnly(['1', '2', '3', '4', '5'])
+        && value.keys().size() == 5
+        && isCount(value['1'])
+        && isCount(value['2'])
+        && isCount(value['3'])
+        && isCount(value['4'])
+        && isCount(value['5']);
+    }
+
+    // Keys a write actually changes versus the stored document. Compared with
+    // an allowlist this is the change *mask*: keys outside the mask stay
+    // untouched, and any key outside the allowlist is rejected. `keys()` on the
+    // incoming payload cannot be used for this — it includes unchanged fields
+    // and the rules runtime raises an evaluation error on `hasOnly` for it.
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // The only catalog mutations a client may perform: fold a rating into the
+    // rating aggregates, or move the review counter as a review is created or
+    // deleted. Catalog metadata is not in the mask, so an overwrite of it has
+    // nowhere to land (SEC-01).
+    function onlyBookAggregates() {
+      return changedKeys().hasOnly([
+        'ratingDistribution', 'averageRating', 'ratingsCount', 'bayesianRating',
+        'reviewsCount', 'updatedAt'
+      ]);
+    }
+
     // ---------------------------------------------------------------------
     // Public reader profiles. Readable by anyone, writable only by the owner.
+    //
+    // The change mask — the keys that actually differ from the stored document
+    // — is restricted to profile presentation fields. `stats` therefore can
+    // never be touched by a client write (SEC-02), while first-party counter
+    // maintenance moves to trusted admin/Cloud Function paths.
     // ---------------------------------------------------------------------
     match /users/{userId} {
       allow read: if true;
-      allow create: if isOwner(userId) && request.resource.data.uid == userId;
+      allow create: if isOwner(userId)
+        && request.resource.data.uid == userId
+        && request.resource.data.displayName is string
+        && request.resource.data.handle is string
+        && request.resource.data.email is string
+        && request.resource.data.stats is map
+        && isCount(request.resource.data.stats.reviewsCount)
+        && isCount(request.resource.data.stats.ratingsCount)
+        && isCount(request.resource.data.stats.booksReadCount)
+        && isCount(request.resource.data.stats.pagesReadTotal)
+        && request.resource.data.get('avatarUrl', '') is string;
       allow update: if isOwner(userId)
         && request.resource.data.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'displayName', 'handle', 'bio', 'location', 'website', 'avatarUrl',
+          'readingGoal', 'preferences', 'updatedAt'
+        ])
+        && request.resource.data.displayName is string
         && request.resource.data.handle is string
-        && request.resource.data.displayName is string;
+        && request.resource.data.handle.matches('^[a-zA-Z0-9_]{3,20}$');
       allow delete: if false;
     }
 
     // ---------------------------------------------------------------------
-    // Catalog documents. Aggregates (averageRating, ratingsCount, bayesianRating)
-    // are written by authenticated transactional rating pipelines.
+    // Catalog documents. Aggregates (averageRating, ratingsCount, bayesianRating,
+    // reviewsCount) are written by authenticated transactional pipelines.
+    //
+    // SEC-01: an update may only reach the aggregate keys plus `updatedAt`.
+    // Core catalog fields (title, authors, pageCount, isbn13, ...) are not in
+    // the allowlist, so they are immutable for general authenticated users — a
+    // metadata overwrite has nowhere to land, and every aggregate that *can*
+    // move is range-checked so a forged score or count is rejected outright.
     // ---------------------------------------------------------------------
     match /books/{bookId} {
       allow read: if true;
       allow create: if isAuthenticated()
         && request.resource.data.title is string
+        && request.resource.data.title.size() >= 1
         && request.resource.data.pageCount is number
         && request.resource.data.ratingsCount is number
         && request.resource.data.ratingDistribution is map;
       allow update: if isAuthenticated()
-        && request.resource.data.title is string
-        && request.resource.data.pageCount is number;
+        && onlyBookAggregates()
+        && isRatingDistribution(request.resource.data.ratingDistribution)
+        && isRatingScore(request.resource.data.averageRating)
+        && isRatingScore(request.resource.data.bayesianRating)
+        && isCount(request.resource.data.ratingsCount)
+        && isCount(request.resource.data.reviewsCount);
       allow delete: if false;
     }
 
@@ -64,6 +146,7 @@ service cloud.firestore {
         && request.resource.data.status is string
         && isShelfStatus(request.resource.data.status)
         && request.resource.data.rating is number
+        && isRatingScore(request.resource.data.rating)
         && request.resource.data.progressPages is number
         && request.resource.data.progressPercentage is number
         && request.resource.data.progressPercentage >= 0
@@ -73,6 +156,10 @@ service cloud.firestore {
 
     // ---------------------------------------------------------------------
     // Reviews. One deterministic review per (user, book) pair.
+    //
+    // SEC-04: an author editing prose may not touch the engagement counters.
+    // `likesCount` moves only through the explicit like path below, which is
+    // gated on the acting reader owning the matching /reviewLikes document.
     // ---------------------------------------------------------------------
     match /reviews/{reviewId} {
       allow read: if true;
@@ -87,14 +174,40 @@ service cloud.firestore {
         && request.resource.data.content is string
         && request.resource.data.content.size() >= 20
         && request.resource.data.content.size() <= 10000
-        && request.resource.data.containsSpoilers is bool;
+        && request.resource.data.containsSpoilers is bool
+        && request.resource.data.get('likesCount', 0) == 0
+        && request.resource.data.get('commentsCount', 0) == 0;
       allow update: if isAuthenticated()
         && resource.data.userId == request.auth.uid
         && request.resource.data.userId == resource.data.userId
         && request.resource.data.bookId == resource.data.bookId
+        && request.resource.data.likesCount == resource.data.likesCount
+        && request.resource.data.commentsCount == resource.data.commentsCount
         && isRatingValue(request.resource.data.rating)
         && request.resource.data.title is string
-        && request.resource.data.content is string;
+        && request.resource.data.title.size() >= 2
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.content is string
+        && request.resource.data.content.size() >= 20
+        && request.resource.data.content.size() <= 10000;
+      // Liking or unliking the review. The acting reader must have just created
+      // their own /reviewLikes row (or be removing the one they already own),
+      // and the counter may move by exactly one step — never by an arbitrary
+      // amount, and never together with any other review field.
+      allow update: if isAuthenticated()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likesCount'])
+        && request.resource.data.likesCount is number
+        && request.resource.data.likesCount >= 0
+        && (
+          (
+            request.resource.data.likesCount == resource.data.likesCount + 1
+            && exists(/databases/$(database)/documents/reviewLikes/$(reviewId + '_' + request.auth.uid))
+          )
+          || (
+            request.resource.data.likesCount == resource.data.likesCount - 1
+            && !exists(/databases/$(database)/documents/reviewLikes/$(reviewId + '_' + request.auth.uid))
+          )
+        );
       allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
 
       match /comments/{commentId} {

@@ -3,6 +3,7 @@ import {
   bookSchema,
   bookSearchFiltersSchema,
   formatValidationIssues,
+  HTTP_URL_SCHEME_REGEX,
   isValidIsbn13,
   normalizeHandle,
   parseBook,
@@ -14,6 +15,7 @@ import {
   reviewDraftSchema,
   shelfStatusSchema,
   userBookShelfSchema,
+  userProfileSchema,
   ValidationRules,
   validateProgress,
   validateRating,
@@ -171,6 +173,73 @@ describe('userProfileSchema', () => {
       preferences: { allowSpoilersDefault: false, isProfilePrivate: false }
     });
     expect(result.success).toBe(false);
+  });
+});
+
+// SEC-05: profile URLs are rendered into href/src attributes, so the protocol
+// scheme is a stored-XSS boundary and only http(s) may survive validation.
+describe('userProfileSchema URL scheme validation (SEC-05)', () => {
+  const maliciousUrls = [
+    'javascript:alert(1)',
+    'JavaScript:alert(document.cookie)',
+    ' javascript:alert(1)',
+    'jav&#x09;ascript:alert(1)',
+    'data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==',
+    'data:image/svg+xml,<svg onload=alert(1)>',
+    'vbscript:msgbox(1)',
+    'file:///etc/passwd',
+    'about:blank',
+    'blob:https://example.com/8f0c1f6e',
+    '//example.com/protocol-relative',
+    'ftp://example.com/avatar.png',
+    'example.com/avatar.png'
+  ];
+
+  it.each(maliciousUrls)('rejects %s as a website', (url) => {
+    const result = parseUserProfile({ ...validProfile, website: url });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.errors.join(' ')).toContain('http:// or https://');
+    }
+  });
+
+  it.each(maliciousUrls)('rejects %s as an avatarUrl', (url) => {
+    const result = parseUserProfile({ ...validProfile, avatarUrl: url });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.errors.join(' ')).toContain('http:// or https://');
+    }
+  });
+
+  it('accepts http and https URLs regardless of case', () => {
+    for (const url of [
+      'http://example.com',
+      'https://example.com/reader?tab=reviews#top',
+      'HTTPS://Example.com/Avatar.PNG',
+      'https://covers.openlibrary.org/b/isbn/9780143127741-L.jpg'
+    ]) {
+      expect(userProfileSchema.safeParse({ ...validProfile, website: url }).success).toBe(true);
+      expect(userProfileSchema.safeParse({ ...validProfile, avatarUrl: url }).success).toBe(true);
+    }
+  });
+
+  it('still accepts the empty strings used by freshly created profiles', () => {
+    const result = parseUserProfile({ ...validProfile, website: '', avatarUrl: '' });
+    expect(result.success).toBe(true);
+  });
+
+  it('keeps the shared scheme contract exported for form-level reuse', () => {
+    expect(HTTP_URL_SCHEME_REGEX.test('https://example.com')).toBe(true);
+    expect(HTTP_URL_SCHEME_REGEX.test('javascript:alert(1)')).toBe(false);
+  });
+
+  it('rejects over-long URLs before they reach the profile document', () => {
+    const longUrl = `https://example.com/${'a'.repeat(ValidationRules.user.website.maxLength)}`;
+    const result = parseUserProfile({ ...validProfile, website: longUrl });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.errors.join(' ')).toContain('300 characters or fewer');
+    }
   });
 });
 

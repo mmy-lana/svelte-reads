@@ -4,8 +4,13 @@
  * One review per reader per book is a data invariant, not a UI convention: the
  * deterministic `${userId}_${bookId}` document id makes duplicates impossible,
  * and the write transaction re-checks existence so two racing submissions can
- * never both succeed. The same transaction maintains the denormalised counters
- * on the book (`reviewsCount`) and on the reader's profile (`stats.reviewsCount`).
+ * never both succeed. The same transaction maintains the denormalised review
+ * counter on the book (`reviewsCount`).
+ *
+ * Profile statistics are deliberately *not* written here. SEC-02 locks
+ * `users/{uid}.stats` to trusted backends, so a client transaction cannot touch
+ * `stats.reviewsCount`; that counter is owned by the server-side stats sync and
+ * the reader's own profile writes stay inside the profile allowlist.
  */
 import {
   collection,
@@ -27,7 +32,7 @@ import {
 import { db as firebaseDb } from '$lib/firebase/client';
 import { parseReview } from '$lib/validation/schemas';
 import { DataIntegrityError, DuplicateReviewError } from '$lib/data/errors';
-import { BOOK_COLLECTION, REVIEW_COLLECTION, USER_COLLECTION } from '$lib/data/shelf-gateway';
+import { BOOK_COLLECTION, REVIEW_COLLECTION } from '$lib/data/shelf-gateway';
 import type { CursorPage, Review, ReviewSortOption } from '$lib/types/domain';
 
 export const DEFAULT_REVIEW_PAGE_SIZE = 10;
@@ -113,7 +118,6 @@ export class FirestoreReviewGateway implements ReviewGateway {
   async createReview(review: Review): Promise<void> {
     const reviewRef = doc(this.#db, REVIEW_COLLECTION, review.id);
     const bookRef = doc(this.#db, BOOK_COLLECTION, review.bookId);
-    const userRef = doc(this.#db, USER_COLLECTION, review.userId);
 
     await runTransaction(this.#db, async (transaction) => {
       const existing = await transaction.get(reviewRef);
@@ -121,10 +125,6 @@ export class FirestoreReviewGateway implements ReviewGateway {
 
       transaction.set(reviewRef, review);
       transaction.update(bookRef, { reviewsCount: increment(1), updatedAt: review.updatedAt });
-      transaction.update(userRef, {
-        'stats.reviewsCount': increment(1),
-        updatedAt: review.updatedAt
-      });
     });
   }
 
@@ -149,9 +149,6 @@ export class FirestoreReviewGateway implements ReviewGateway {
       transaction.delete(reviewRef);
       transaction.update(doc(this.#db, BOOK_COLLECTION, review.bookId), {
         reviewsCount: increment(-1)
-      });
-      transaction.update(doc(this.#db, USER_COLLECTION, review.userId), {
-        'stats.reviewsCount': increment(-1)
       });
     });
   }
