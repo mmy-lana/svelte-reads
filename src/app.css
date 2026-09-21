@@ -1,33 +1,230 @@
-@import "tailwindcss";
+@import 'tailwindcss';
 
-@custom-variant dark (&:where(.dark, .dark *));
+/* ---------------------------------------------------------------------------
+   Dark mode
+   System preference by default; <html class="dark"> or <html class="light">
+   overrides it. Both branches resolve to the same token set below.
+   --------------------------------------------------------------------------- */
+@custom-variant dark {
+  @media (prefers-color-scheme: dark) {
+    &:where(html:not(.light), html:not(.light) *) {
+      @slot;
+    }
+  }
+  &:where(.dark, .dark *) {
+    @slot;
+  }
+}
+
+@theme {
+  /* -------------------------------------------------------------------------
+     Typography — editorial serif titles, humanist sans UI, mono metrics.
+     Families load in app.html with font-display: swap and system fallbacks.
+     ------------------------------------------------------------------------- */
+  --font-sans:
+    'Plus Jakarta Sans', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    'Helvetica Neue', sans-serif;
+  --font-serif:
+    'Newsreader', Merriweather, ui-serif, Georgia, Cambria, 'Times New Roman', Times, serif;
+  --font-mono:
+    'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* Fluid editorial scale keeps 360px viewports readable without media queries. */
+  --text-display: clamp(2.25rem, 1.6rem + 2.6vw, 3.5rem);
+  --text-display--line-height: 1.05;
+  --text-display--letter-spacing: -0.022em;
+  --text-display--font-weight: 700;
+
+  --text-title: clamp(1.5rem, 1.2rem + 1.2vw, 2.25rem);
+  --text-title--line-height: 1.15;
+  --text-title--letter-spacing: -0.012em;
+
+  --text-metric: clamp(1.5rem, 1.3rem + 0.8vw, 2.25rem);
+  --text-metric--line-height: 1;
+  --text-metric--font-weight: 700;
+
+  /* -------------------------------------------------------------------------
+     Warm primary palette — amber / ochre
+     ------------------------------------------------------------------------- */
+  --color-primary-50: #fffbeb;
+  --color-primary-100: #fef3c7;
+  --color-primary-200: #fde68a;
+  --color-primary-300: #fcd34d;
+  --color-primary-400: #fbbf24;
+  --color-primary-500: #f59e0b;
+  --color-primary-600: #d97706;
+  --color-primary-700: #b45309;
+  --color-primary-800: #92400e;
+  --color-primary-900: #78350f;
+  --color-primary-950: #451a03;
+
+  /* Surfaces — warm paper light, warm ink dark */
+  --color-canvas: #fafaf9;
+  --color-canvas-raised: #ffffff;
+  --color-canvas-sunken: #f5f5f4;
+  --color-night: #0c0a09;
+  --color-night-raised: #1c1917;
+  --color-night-sunken: #292524;
+  --color-ink: #1c1917;
+  --color-ink-muted: #57534e;
+  --color-paper: #fafaf9;
+  --color-paper-muted: #a8a29e;
+
+  /* -------------------------------------------------------------------------
+     Elevation tokens — warm, low-contrast shadows (never pure black)
+     ------------------------------------------------------------------------- */
+  --shadow-elevation-1: 0 1px 2px 0 rgb(28 25 23 / 0.05), 0 1px 3px 0 rgb(28 25 23 / 0.06);
+  --shadow-elevation-2: 0 2px 4px -1px rgb(28 25 23 / 0.06), 0 4px 12px -2px rgb(28 25 23 / 0.08);
+  --shadow-elevation-3: 0 8px 16px -4px rgb(28 25 23 / 0.08), 0 16px 32px -8px rgb(28 25 23 / 0.12);
+  --shadow-elevation-4: 0 16px 32px -8px rgb(28 25 23 / 0.12), 0 32px 64px -16px rgb(28 25 23 / 0.18);
+
+  --radius-card: 1rem;
+  --radius-control: 0.625rem;
+  --radius-pill: 9999px;
+
+  /* -------------------------------------------------------------------------
+     Motion — one editorial easing curve; transform/opacity only
+     ------------------------------------------------------------------------- */
+  --ease-editorial: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+
+  --animate-fade-in: fade-in 240ms var(--ease-editorial) both;
+  --animate-rise: rise 320ms var(--ease-editorial) both;
+  --animate-spin-slow: spin 1.1s linear infinite;
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  /* Extra breakpoint for the narrowest certified viewport (360px). */
+  --breakpoint-xs: 22.5rem;
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+
+  /* `color-scheme` fixes native scrollbars and form controls per theme. */
+  html.dark {
+    color-scheme: dark;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    html:not(.light) {
+      color-scheme: dark;
+    }
+  }
+
+  body {
+    @apply bg-canvas text-ink font-sans antialiased;
+    -webkit-tap-highlight-color: rgb(217 119 6 / 0.16);
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+
+  body:where(.dark, .dark *) {
+    @apply bg-night text-paper;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    body:where(html:not(.light) *) {
+      @apply bg-night text-paper;
+    }
+  }
+
+  /* Focus is always visible and never removed without a replacement. */
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-primary-600);
+    outline-offset: 2px;
+    border-radius: var(--radius-control);
+  }
+
+  :where(html.dark) :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline-color: var(--color-primary-400);
+  }
+
+  ::selection {
+    background-color: var(--color-primary-200);
+    color: var(--color-primary-950);
+  }
+
+  /* Ratings, page counts, and percentages line up in columns. */
+  :where(.font-mono, [data-numeric]) {
+    font-variant-numeric: tabular-nums;
+  }
+
+  :where(h1, h2, h3) {
+    text-wrap: balance;
+  }
+
+  :where(p) {
+    text-wrap: pretty;
+  }
+
+  :where(img, video) {
+    max-width: 100%;
+    height: auto;
+  }
+}
+
+/* Touch and safe-area utilities shared by shells, sheets, and controls. */
+@utility touch-manipulation {
+  touch-action: manipulation;
+}
+
+@utility touch-target {
+  min-height: 2.75rem;
+  min-width: 2.75rem;
+}
 
 @utility safe-area-bottom {
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
-@theme {
-  --color-amber-50: #fffbeb;
-  --color-amber-100: #fef3c7;
-  --color-amber-200: #fde68a;
-  --color-amber-500: #f59e0b;
-  --color-amber-600: #d97706;
-  --color-amber-700: #b45309;
-  --color-amber-800: #92400e;
-  --color-amber-900: #78350f;
-  --color-amber-950: #451a03;
-  --color-stone-50: #fafaf9;
-  --color-stone-100: #f5f5f4;
-  --color-stone-200: #e7e5e4;
-  --color-stone-300: #d6d3d1;
-  --color-stone-400: #a8a29e;
-  --color-stone-500: #78716c;
-  --color-stone-600: #57534e;
-  --color-stone-700: #44403c;
-  --color-stone-800: #292524;
-  --color-stone-900: #1c1917;
-  --color-stone-950: #0c0a09;
-  --font-serif: Newsreader, Merriweather, Georgia, serif;
-  --font-sans: Inter, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", monospace;
+@utility safe-area-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+@utility safe-area-x {
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+@utility scrollbar-none {
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Honour reduced-motion globally: animations collapse, transitions become instant. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
