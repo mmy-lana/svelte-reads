@@ -174,6 +174,144 @@ describe('ReviewStore writing', () => {
   });
 });
 
+describe('ReviewStore helpful votes', () => {
+  let harness: ReturnType<typeof buildHarness>;
+  /** A review with an existing tally, and the gateway that agrees with it. */
+  function seed(harness: ReturnType<typeof buildHarness>, likesCount = 7) {
+    const book = makeBook();
+    const review = makeReview({ id: 'r-liked', likesCount });
+    harness.store.reviews.set(book.id, [review]);
+    harness.gateway.voteCounts.set(review.id, likesCount);
+    return { book, review };
+  }
+
+  beforeEach(() => {
+    harness = buildHarness();
+  });
+
+  it('counts the vote optimistically, then adopts the committed tally', async () => {
+    const { store, gateway } = harness;
+    const { book, review } = seed(harness, 7);
+    gateway.hold = createDeferred<void>();
+
+    const pending = store.toggleHelpfulVote(book.id, review.id);
+
+    // Optimistic: the tap is answered before the round trip finishes.
+    expect(store.reviewsFor(book.id)[0]?.likesCount).toBe(8);
+    expect(store.hasVotedHelpful(review.id)).toBe(true);
+    expect(store.isVotingHelpful(review.id)).toBe(true);
+
+    gateway.hold.resolve();
+    gateway.hold = null;
+    await pending;
+
+    expect(gateway.voteToggles).toEqual([review.id]);
+    expect(gateway.votes.has(review.id)).toBe(true);
+    expect(store.reviewsFor(book.id)[0]?.likesCount).toBe(8);
+    expect(store.hasVotedHelpful(review.id)).toBe(true);
+    expect(store.isVotingHelpful(review.id)).toBe(false);
+    expect(store.helpfulVoteFailureFor(review.id)).toBeNull();
+  });
+
+  it('reconciles an optimistic upvote with the transaction that unvotes', async () => {
+    const { store, gateway } = harness;
+    const { book, review } = seed(harness, 5);
+    // The reader already voted in an earlier session, which this client never
+    // hydrated: the first click must therefore settle as a *removal*.
+    gateway.votes.add(review.id);
+
+    await store.toggleHelpfulVote(book.id, review.id);
+
+    expect(store.reviewsFor(book.id)[0]?.likesCount).toBe(4);
+    expect(store.hasVotedHelpful(review.id)).toBe(false);
+    expect(gateway.votes.has(review.id)).toBe(false);
+  });
+
+  it('never lets the tally drift when the guess and the commit disagree', async () => {
+    const { store, gateway } = harness;
+    const { book, review } = seed(harness, 5);
+    gateway.votes.add(review.id);
+
+    await store.toggleHelpfulVote(book.id, review.id);
+    const afterUnvote = store.reviewsFor(book.id)[0]?.likesCount;
+    expect(afterUnvote).toBe(4);
+
+    await store.toggleHelpfulVote(book.id, review.id);
+    expect(store.reviewsFor(book.id)[0]?.likesCount).toBe(5);
+    expect(gateway.voteCounts.get(review.id)).toBe(5);
+  });
+
+  it('restores the previous tally when the transaction is rejected', async () => {
+    const { store, gateway } = harness;
+    const { book, review } = seed(harness, 3);
+    gateway.failNext = firestoreError('unavailable');
+
+    await expect(store.toggleHelpfulVote(book.id, review.id)).rejects.toMatchObject({
+      code: 'unavailable'
+    });
+
+    expect(store.reviewsFor(book.id)[0]?.likesCount).toBe(3);
+    expect(store.hasVotedHelpful(review.id)).toBe(false);
+    expect(store.isVotingHelpful(review.id)).toBe(false);
+    expect(store.helpfulVoteFailureFor(review.id)).toContain('offline');
+    // The feed failure channel is untouched: a failed vote must not blank the
+    // review list, which renders `failureFor` as a full-page error state.
+    expect(store.failureFor(book.id)).toBeNull();
+  });
+
+  it('drops a second tap while the first vote is still committing', async () => {
+    const { store, gateway } = harness;
+    const { book, review } = seed(harness, 2);
+    gateway.hold = createDeferred<void>();
+
+    const pending = store.toggleHelpfulVote(book.id, review.id);
+    await store.toggleHelpfulVote(book.id, review.id);
+
+    gateway.hold.resolve();
+    gateway.hold = null;
+    await pending;
+
+    expect(gateway.voteToggles).toEqual([review.id]);
+    expect(store.reviewsFor(book.id)[0]?.likesCount).toBe(3);
+  });
+
+  it('requires a signed-in reader to vote', async () => {
+    const { store, gateway } = buildHarness({ signedIn: false });
+    const book = makeBook();
+    const review = makeReview({ id: 'r-liked', likesCount: 2 });
+    store.reviews.set(book.id, [review]);
+
+    await expect(store.toggleHelpfulVote(book.id, review.id)).rejects.toThrow('Sign in');
+    expect(gateway.voteToggles).toHaveLength(0);
+    expect(store.reviewsFor(book.id)[0]?.likesCount).toBe(2);
+  });
+
+  it('does not lend one reader the next reader’s vote state', async () => {
+    const gateway = new FakeReviewGateway();
+    let user: ReturnType<typeof makeUser> | null = makeUser();
+    const store = createReviewStore({
+      gateway,
+      currentUser: () => user,
+      now: () => FIXED_NOW
+    });
+
+    const book = makeBook();
+    const review = makeReview({ id: 'r-liked', likesCount: 1 });
+    store.reviews.set(book.id, [review]);
+
+    await store.toggleHelpfulVote(book.id, review.id);
+    expect(store.hasVotedHelpful(review.id)).toBe(true);
+
+    // The store outlives the session: reviews are public data and nothing clears
+    // it on sign-out, so the cached vote must not follow the next reader in.
+    user = makeUser({ uid: 'reader-2' });
+    expect(store.hasVotedHelpful(review.id)).toBe(false);
+
+    user = null;
+    expect(store.hasVotedHelpful(review.id)).toBe(false);
+  });
+});
+
 describe('ReviewStore feeds', () => {
   it('loads a page, then appends the next one', async () => {
     const { store, gateway } = buildHarness();

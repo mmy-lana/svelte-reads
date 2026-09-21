@@ -12,8 +12,12 @@
   /**
    * Shelf picker with no hover dependency: below 768px it opens as a bottom
    * sheet, at and above 768px it becomes a popover anchored to the trigger.
-   * Both variants render the same listbox, so keyboard and screen-reader
-   * behaviour is identical across viewports.
+   * Both variants render the same listbox, so the option set, the arrow-key
+   * navigation, and the screen-reader semantics are identical across viewports.
+   *
+   * The difference is modality: the sheet covers the page with a click-away
+   * layer, so it traps Tab inside the panel; the popover is a plain disclosure
+   * and lets Tab continue through the page.
    */
   interface Props {
     bookId: string;
@@ -50,6 +54,8 @@
   let errorMessage = $state<string | null>(null);
   let triggerElement: HTMLButtonElement | null = $state(null);
   let panelElement: HTMLDivElement | null = $state(null);
+  /** True while the panel is rendered as the modal bottom sheet (DEF-03). */
+  let isBottomSheet = $state(false);
 
   const triggerLabel = $derived(
     currentStatus ? SHELF_STATUS_SHORT_LABELS[currentStatus] : 'Add to Shelf'
@@ -77,6 +83,36 @@
     return Array.from(panelElement.querySelectorAll<HTMLButtonElement>('[role="option"]'));
   }
 
+  /**
+   * DEF-03: reads the mode from the *rendered* panel rather than re-deriving
+   * Tailwind's breakpoint here.
+   *
+   * `position: fixed` is precisely what the `md:` variants swap away when the
+   * panel becomes a trigger-anchored popover, so the focus trap can never
+   * disagree with the layout a reader is actually looking at — including zoom
+   * levels and rem-based breakpoint resolution that a duplicated `768` would get
+   * wrong.
+   */
+  function syncSheetMode(): void {
+    isBottomSheet =
+      typeof window !== 'undefined' && panelElement !== null
+        ? window.getComputedStyle(panelElement).position === 'fixed'
+        : false;
+  }
+
+  $effect(() => {
+    if (!isOpen || panelElement === null) {
+      isBottomSheet = false;
+      return;
+    }
+
+    // Runs after the panel is in the DOM, so the computed style is real. A
+    // viewport change across the breakpoint re-evaluates the mode mid-session.
+    syncSheetMode();
+    window.addEventListener('resize', syncSheetMode);
+    return () => window.removeEventListener('resize', syncSheetMode);
+  });
+
   async function open(): Promise<void> {
     if (isBusy) return;
     errorMessage = null;
@@ -88,6 +124,12 @@
     (selected ?? options[0])?.focus();
   }
 
+  /**
+   * Every close path funnels through here — Escape, the click-away layer, and a
+   * committed selection — so focus is handed back to the trigger exactly once
+   * instead of being dropped on `<body>` where the reader would lose their place
+   * in the page (DEF-03).
+   */
   function close(): void {
     if (!isOpen) return;
     isOpen = false;
@@ -120,6 +162,15 @@
     }
   }
 
+  /**
+   * Keyboard contract for the open panel.
+   *
+   * Arrow/Home/End navigation is identical in both modes. Tab is where the modes
+   * differ: the bottom sheet is modal (a click-away layer covers the page, so
+   * anything Tab could reach behind it is unreachable by pointer as well), and
+   * focus therefore wraps inside the panel. The desktop popover is non-modal and
+   * keeps native Tab behaviour, so a reader can simply Tab onward.
+   */
   function handlePanelKeyDown(event: KeyboardEvent): void {
     const options = optionElements();
     if (options.length === 0) return;
@@ -143,6 +194,25 @@
         event.preventDefault();
         options[options.length - 1]?.focus();
         break;
+      case 'Tab': {
+        if (!isBottomSheet) break;
+
+        const first = options[0];
+        const last = options[options.length - 1];
+        if (!first || !last) break;
+
+        // `activeIndex === -1` means focus sits on the panel container itself
+        // (`tabindex="-1"`), which precedes the options in DOM order: Tab walks
+        // into the first option naturally, but Shift+Tab would leave the sheet.
+        if (event.shiftKey && activeIndex <= 0) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && activeIndex === options.length - 1) {
+          event.preventDefault();
+          first.focus();
+        }
+        break;
+      }
       default:
         break;
     }

@@ -13,6 +13,11 @@
  *   - `updateReview`/`deleteReview` snapshot the previous list and restore it
  *     verbatim when the write fails.
  *
+ * The helpful vote follows the same contract as the write-side mutations, with
+ * one addition: the gateway's atomic transaction returns the committed vote
+ * state, so the optimistic count is replaced by the authoritative one instead of
+ * being trusted.
+ *
  * Review counters on the book and on the reader's profile are maintained by the
  * gateway transaction, so they can never drift from the review documents.
  */
@@ -83,6 +88,28 @@ export class ReviewStore {
   failures = new SvelteMap<string, string>();
   /** Whether more feed pages exist, per book. */
   more = new SvelteMap<string, boolean>();
+  /**
+   * Review ids this session has confirmed the reader voted helpful on.
+   *
+   * Keyed by review id (not book) because the vote, like the like document
+   * itself, belongs to the review.
+   */
+  votedHelpful = new SvelteSet<string>();
+  /** Review ids with a helpful-vote toggle in flight. */
+  votingHelpful = new SvelteSet<string>();
+  /** Latest helpful-vote failure per review id. */
+  voteFailures = new SvelteMap<string, string>();
+
+  /**
+   * uid the cached vote state belongs to.
+   *
+   * A vote is the reader's own row, and this store outlives a session (nothing
+   * calls `clear()` on sign-out because review feeds are public data), so the
+   * pressed state is only reported while the acting reader is the one who voted.
+   * Otherwise a reader who signs in after another would see their own reviews
+   * pre-voted — an `aria-pressed` state that is simply not true.
+   */
+  #votedHelpfulUserId = $state<string | null>(null);
 
   #gateway: ReviewGateway;
   #currentUser: () => AuthUser | null;
@@ -130,6 +157,29 @@ export class ReviewStore {
     return this.more.get(bookId) ?? false;
   }
 
+  /**
+   * True once this session has confirmed the reader's helpful vote exists.
+   *
+   * Reading the acting reader here (rather than only at write time) keeps the
+   * pressed state honest across a sign-out/sign-in: a vote cached for another
+   * reader reports `false` instead of a borrowed `aria-pressed="true"`.
+   */
+  hasVotedHelpful(reviewId: string): boolean {
+    const user = this.#currentUser();
+    if (!user || user.uid !== this.#votedHelpfulUserId) return false;
+    return this.votedHelpful.has(reviewId);
+  }
+
+  /** True while a helpful vote for this review is still being committed. */
+  isVotingHelpful(reviewId: string): boolean {
+    return this.votingHelpful.has(reviewId);
+  }
+
+  /** Reader-facing reason the last helpful vote on this review was reverted. */
+  helpfulVoteFailureFor(reviewId: string): string | null {
+    return this.voteFailures.get(reviewId) ?? null;
+  }
+
   /** The signed-in reader's review for a book, if one exists locally. */
   ownReview(bookId: string): Review | null {
     const user = this.#currentUser();
@@ -149,6 +199,10 @@ export class ReviewStore {
     this.pending.clear();
     this.failures.clear();
     this.more.clear();
+    this.votedHelpful.clear();
+    this.votingHelpful.clear();
+    this.voteFailures.clear();
+    this.#votedHelpfulUserId = null;
     this.#cursors = new Map();
   }
 
@@ -307,6 +361,97 @@ export class ReviewStore {
       },
       commit: () => this.#gateway.updateReview(input)
     });
+  }
+
+  /**
+   * Toggles the reader's helpful vote on one review.
+   *
+   * `bookId` leads the argument list for the same reason it does on
+   * `updateReview` and `deleteReview`: the feed is cached per book, and the
+   * optimistic edit has to reach the right list without scanning every cached
+   * book for the review id.
+   *
+   * The write itself is atomic in the gateway — the `/reviewLikes` row and the
+   * single-step `likesCount` change share one transaction, which is what the
+   * Phase 1 rule requires. What this method adds is the optimistic layer:
+   *
+   *   - the count steps immediately and the button renders pressed, so the
+   *     control answers a tap without waiting for the round trip;
+   *   - the transaction's committed result then *replaces* that guess, so the
+   *     counter can never drift from the server even if the guess was wrong;
+   *   - a rejection restores the previous list verbatim and records why.
+   *
+   * The guess is always an upvote, because nothing hydrates `/reviewLikes` for
+   * a feed: the reader's prior state is unknown until the transaction answers.
+   * The visible cost is a brief upvote on the first click against a review the
+   * reader had already voted on; the alternative — delaying the count until the
+   * server replies — would leave the button feeling dead on a slow connection.
+   *
+   * `likesCount` is deliberately *not* re-sorted here. A successful vote must not
+   * make the list jump under the reader's finger while the "most helpful" order
+   * is active; the next feed load or explicit re-sort picks up the new order.
+   */
+  async toggleHelpfulVote(bookId: string, reviewId: string): Promise<void> {
+    this.#requireUser('vote a review helpful');
+
+    // A second tap while the first is still committing is dropped rather than
+    // queued: two overlapping toggles would race the same counter, and the
+    // button advertises the in-flight state through `isVotingHelpful`.
+    if (this.votingHelpful.has(reviewId)) return;
+
+    const previous = this.reviewsFor(bookId);
+    const existing = previous.find((review) => review.id === reviewId);
+    if (!existing) return;
+
+    const wasVoted = this.votedHelpful.has(reviewId);
+
+    this.votingHelpful.add(reviewId);
+    this.voteFailures.delete(reviewId);
+    this.#applyHelpfulVote(bookId, reviewId, {
+      likesCount: existing.likesCount + 1,
+      voted: true
+    });
+
+    try {
+      const result = await this.#gateway.toggleHelpfulVote(reviewId);
+      this.#applyHelpfulVote(bookId, reviewId, result);
+    } catch (error) {
+      this.reviews.set(bookId, previous);
+      this.#setVotedHelpful(reviewId, wasVoted);
+      this.voteFailures.set(
+        reviewId,
+        describeWriteFailure(error, 'That helpful vote could not be saved, so it was reverted.')
+      );
+      throw error;
+    } finally {
+      this.votingHelpful.delete(reviewId);
+    }
+  }
+
+  /** Writes one review's vote state into the cached feed and the voted set. */
+  #applyHelpfulVote(
+    bookId: string,
+    reviewId: string,
+    next: { likesCount: number; voted: boolean }
+  ): void {
+    const likesCount = Math.max(next.likesCount, 0);
+
+    this.reviews.set(
+      bookId,
+      this.reviewsFor(bookId).map((review) =>
+        review.id === reviewId ? { ...review, likesCount } : review
+      )
+    );
+    this.#setVotedHelpful(reviewId, next.voted);
+  }
+
+  #setVotedHelpful(reviewId: string, voted: boolean): void {
+    // The whole set is stamped with the reader who produced it: a later session
+    // reading this store must not inherit the previous reader's votes.
+    this.#votedHelpfulUserId = this.#currentUser()?.uid ?? null;
+
+    if (voted) this.votedHelpful.add(reviewId);
+    else this.votedHelpful.delete(reviewId);
   }
 
   /** Deletes a review, restoring the list if the delete is rejected. */

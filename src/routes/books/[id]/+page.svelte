@@ -23,13 +23,14 @@
     totalRatings
   } from '$lib/utils/ratings';
   import { countLabel, formatDate, formatNumber, formatPageCount, formatRelativeDate } from '$lib/utils/format';
+  import { cx } from '$lib/utils/cx';
   import {
     decideRatingSubmission,
     ratingFailureNotice,
     reviewPayloadFromDraft
   } from '$lib/utils/review-submission';
   import { SHELF_STATUS_LABELS } from '$lib/utils/shelf-state-machine';
-  import type { ReviewDraft, ReviewSortOption, ShelfStatus } from '$lib/types/domain';
+  import type { Review, ReviewDraft, ReviewSortOption, ShelfStatus } from '$lib/types/domain';
 
   /**
    * Editorial detail page.
@@ -37,6 +38,10 @@
    * Shows the catalog metadata, the community score with its confidence
    * explanation, the reader's own shelf/progress/rating controls, and the review
    * feed. Each asynchronous surface owns its loading, empty, and error state.
+   *
+   * UI-02: every review card ends in a helpful-vote toggle — a real button, sized
+   * to the 44px touch contract, whose optimistic count is reconciled by the store
+   * against the transaction that committed it.
    */
   const bookId = $derived(page.params.id ?? '');
 
@@ -55,6 +60,12 @@
   let isDeletingReview = $state(false);
   let confirmDelete = $state(false);
   let shelfFailure = $state<string | null>(null);
+  /**
+   * Set when a helpful vote cannot be attempted at all (no session yet); kept
+   * apart from the store's own per-review failures so the prompt is visible next
+   * to the feed instead of beside one card.
+   */
+  let voteNotice = $state<string | null>(null);
   // One generated id per component; suffixes keep the label/control pairs unique.
   const uid = $props.id();
   const titleFieldId = `${uid}-review-title`;
@@ -267,6 +278,53 @@
     } catch (error) {
       shelfFailure = shelfStore.failureFor(book.id) ?? (error instanceof Error ? error.message : 'That progress could not be saved.');
     }
+  }
+
+  /**
+   * UI-02: one tap toggles the reader's helpful vote.
+   *
+   * A signed-out reader is told why instead of being handed a dead control: the
+   * button stays enabled and focusable for exactly that reason. Failures after a
+   * real attempt live in the store, keyed by review, and render against the card
+   * that owns the vote — a failed vote must never blank the whole feed.
+   */
+  async function toggleHelpfulVote(review: Review): Promise<void> {
+    if (!authState.user) {
+      voteNotice = 'Sign in to vote a review helpful.';
+      return;
+    }
+
+    voteNotice = null;
+
+    try {
+      await reviewStore.toggleHelpfulVote(bookId, review.id);
+    } catch {
+      // The store has already restored the previous count and recorded a
+      // reader-facing reason, which `helpfulVoteFailureFor` renders inline. A
+      // session that expired between the tap and the write rejects *before* any
+      // optimistic change, so an empty failure means the vote never left the
+      // device and the reader needs the sign-in prompt rather than a revert
+      // notice.
+      if (reviewStore.helpfulVoteFailureFor(review.id) === null) {
+        voteNotice = 'Sign in to vote a review helpful.';
+      }
+    }
+  }
+
+  /**
+   * Accessible name for the vote toggle (UI-02).
+   *
+   * It leads with the visible "Helpful" label and restates the visible count, so
+   * the name still contains its label (WCAG 2.5.3 Label in Name), then adds the
+   * action that the pressed state alone cannot convey. The count is part of the
+   * name because the visible number is the only place the tally is exposed.
+   */
+  function helpfulVoteLabel(review: Review): string {
+    const who = review.userDisplayName || 'this reader';
+    const votes = countLabel(review.likesCount, 'helpful vote');
+    return reviewStore.hasVotedHelpful(review.id)
+      ? `Helpful. Remove your vote from ${who}'s review — ${votes} so far.`
+      : `Helpful. Add your vote to ${who}'s review — ${votes} so far.`;
   }
 </script>
 
@@ -543,6 +601,18 @@
 
         <div aria-live="polite" class="sr-only">{composerStatus ?? ''}</div>
 
+        {#if voteNotice}
+          <p
+            class="mt-4 rounded-[var(--radius-control)] border border-amber-300 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+            role="alert"
+          >
+            {voteNotice}
+            <button type="button" class="ml-2 underline" onclick={() => (voteNotice = null)}>
+              Dismiss
+            </button>
+          </p>
+        {/if}
+
         {#if ratingWarning && !composerOpen}
           <p
             class="mt-4 rounded-[var(--radius-control)] border border-amber-300 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
@@ -745,13 +815,40 @@
                     </ul>
                   {/if}
 
-                  <footer class="mt-3 flex flex-wrap items-center gap-4 text-xs text-stone-500 dark:text-stone-400">
-                    <span>{countLabel(review.likesCount, 'helpful vote')}</span>
+                  <footer class="mt-3 flex flex-wrap items-center gap-3 text-xs text-stone-500 dark:text-stone-400">
+                    <button
+                      type="button"
+                      class={cx(
+                        '-ml-2 inline-flex min-h-11 items-center gap-1.5 rounded-[var(--radius-control)] px-2 text-xs font-semibold touch-manipulation',
+                        'transition-[background-color,color] duration-150 ease-out',
+                        'focus-visible:outline-2 focus-visible:outline-offset-2',
+                        reviewStore.hasVotedHelpful(review.id)
+                          ? 'bg-primary-50 text-primary-800 dark:bg-primary-950/40 dark:text-primary-200'
+                          : 'text-stone-600 hover:bg-stone-100 hover:text-stone-900 dark:text-stone-300 dark:hover:bg-stone-800 dark:hover:text-stone-100'
+                      )}
+                      aria-pressed={reviewStore.hasVotedHelpful(review.id)}
+                      aria-busy={reviewStore.isVotingHelpful(review.id)}
+                      aria-label={helpfulVoteLabel(review)}
+                      onclick={() => void toggleHelpfulVote(review)}
+                    >
+                      <svg class="h-4 w-4 shrink-0" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                        <path d="M10 3.5 17 13H3z" />
+                        <rect x="4.5" y="14.5" width="11" height="2" rx="1" />
+                      </svg>
+                      <span>Helpful</span>
+                      <span class="tabular-nums font-normal">{formatNumber(review.likesCount)}</span>
+                    </button>
                     <span>{countLabel(review.commentsCount, 'comment')}</span>
                     {#if ownReview?.id === review.id}
                       <span class="font-medium text-primary-700 dark:text-primary-300">Your review</span>
                     {/if}
                   </footer>
+
+                  {#if reviewStore.helpfulVoteFailureFor(review.id)}
+                    <p class="mt-2 text-xs font-medium text-rose-700 dark:text-rose-300" role="alert">
+                      {reviewStore.helpfulVoteFailureFor(review.id)}
+                    </p>
+                  {/if}
                 </article>
               </li>
             {/each}

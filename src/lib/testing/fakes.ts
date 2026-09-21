@@ -18,6 +18,7 @@ import type {
   ShelfListQuery
 } from '$lib/data/shelf-gateway';
 import type {
+  HelpfulVoteResult,
   ReviewGateway,
   ReviewListQuery,
   ReviewUpdateInput
@@ -146,6 +147,25 @@ export class FakeReviewGateway implements ReviewGateway {
   listQueries: ReviewListQuery[] = [];
   pages: CursorPage<Review>[] = [];
 
+  /**
+   * Review ids the fake reader has voted helpful on.
+   *
+   * Seeded by a test to describe a reader who already voted; the toggle flips it,
+   * which is what makes the "authoritative state replaces the optimistic guess"
+   * path observable.
+   */
+  votes = new Set<string>();
+  /**
+   * Authoritative `likesCount` per review id.
+   *
+   * A test seeds this alongside `votes` so the value the fake commits matches the
+   * stored review; an unseeded review starts from zero, exactly as a freshly
+   * created review document does.
+   */
+  voteCounts = new Map<string, number>();
+  /** Review ids passed to `toggleHelpfulVote`, in call order. */
+  voteToggles: string[] = [];
+
   failNext: unknown = null;
   /** When set, every feed read rejects with this error. */
   listFailure: unknown = null;
@@ -181,5 +201,29 @@ export class FakeReviewGateway implements ReviewGateway {
 
   async getReview(reviewId: string): Promise<Review | null> {
     return this.created.find((review) => review.id === reviewId) ?? null;
+  }
+
+  /**
+   * Mirrors the real transaction: it decides from its own stored like row, not
+   * from an argument, and answers with the committed state. A seeded `votes` entry
+   * therefore produces an *unvote*, which is how the store's optimistic upvote
+   * guess is shown to be reconciled.
+   */
+  async toggleHelpfulVote(reviewId: string): Promise<HelpfulVoteResult> {
+    if (this.hold) await this.hold.promise;
+    if (this.failNext) throw this.failNext;
+
+    this.voteToggles.push(reviewId);
+
+    const stored = this.voteCounts.get(reviewId) ?? 0;
+    const voted = !this.votes.has(reviewId);
+
+    if (voted) this.votes.add(reviewId);
+    else this.votes.delete(reviewId);
+
+    const likesCount = Math.max(voted ? stored + 1 : stored - 1, 0);
+    this.voteCounts.set(reviewId, likesCount);
+
+    return { voted, likesCount };
   }
 }

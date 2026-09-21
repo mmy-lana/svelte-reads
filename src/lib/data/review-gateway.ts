@@ -12,6 +12,10 @@
  * the review document itself, so a feed can never render orphaned engagement
  * against a review that no longer exists.
  *
+ * Engagement the reader controls is atomic for the same reason. A helpful vote
+ * writes the caller's `/reviewLikes` row and steps `likesCount` together, which
+ * is the only shape the Phase 1 rules accept.
+ *
  * Profile statistics are deliberately *not* written here. SEC-02 locks
  * `users/{uid}.stats` to trusted backends, so a client transaction cannot touch
  * `stats.reviewsCount`; that counter is owned by the server-side stats sync and
@@ -39,7 +43,7 @@ import { db as firebaseDb, auth } from '$lib/firebase/client';
 import { parseReview } from '$lib/validation/schemas';
 import { DataIntegrityError, DuplicateReviewError, WriteRejectedError } from '$lib/data/errors';
 import { BOOK_COLLECTION, REVIEW_COLLECTION } from '$lib/data/shelf-gateway';
-import type { CursorPage, Review, ReviewSortOption } from '$lib/types/domain';
+import type { CursorPage, Review, ReviewLike, ReviewSortOption } from '$lib/types/domain';
 
 export const DEFAULT_REVIEW_PAGE_SIZE = 10;
 
@@ -47,6 +51,24 @@ export const DEFAULT_REVIEW_PAGE_SIZE = 10;
 export const REVIEW_LIKE_COLLECTION = 'reviewLikes';
 /** Comments subcollection beneath each review document. */
 export const REVIEW_COMMENT_COLLECTION = 'comments';
+
+/**
+ * Compound like id shared with `firestore.rules`: `${reviewId}_${userId}`.
+ *
+ * The rule for `/reviewLikes/{likeId}` asserts exactly this shape, so the id is
+ * derived here rather than assembled at each call site.
+ */
+export function likeIdFor(reviewId: string, userId: string): string {
+  return `${reviewId}_${userId}`;
+}
+
+/** Outcome of a helpful-vote toggle, as committed by the transaction. */
+export interface HelpfulVoteResult {
+  /** True when the acting reader's own `/reviewLikes` row exists after the commit. */
+  voted: boolean;
+  /** Authoritative `likesCount` on `reviews/{reviewId}` after the commit. */
+  likesCount: number;
+}
 
 /**
  * Maximum dependent documents retired in a single delete call.
@@ -98,6 +120,13 @@ export interface ReviewGateway {
    */
   deleteReview(reviewId: string): Promise<void>;
   getReview(reviewId: string): Promise<Review | null>;
+  /**
+   * Toggles the acting reader's helpful vote on a review, creating or deleting
+   * their own `/reviewLikes` row and stepping `reviews/{reviewId}.likesCount` by
+   * exactly one inside a single transaction. Resolves with the committed state so
+   * the caller can replace its optimistic guess with the authoritative values.
+   */
+  toggleHelpfulVote(reviewId: string): Promise<HelpfulVoteResult>;
 }
 
 /**
@@ -142,12 +171,19 @@ export class FirestoreReviewGateway implements ReviewGateway {
   #db: Firestore;
   /** Resolves the acting reader's uid for ownership assertions. */
   #currentUserId: () => string | null;
+  /** Timestamp source for like rows, injectable for deterministic tests. */
+  #now: () => string;
 
   constructor(
-    options: { firestore?: Firestore; currentUserId?: () => string | null } = {}
+    options: {
+      firestore?: Firestore;
+      currentUserId?: () => string | null;
+      now?: () => string;
+    } = {}
   ) {
     this.#db = options.firestore ?? firebaseDb;
     this.#currentUserId = options.currentUserId ?? (() => auth.currentUser?.uid ?? null);
+    this.#now = options.now ?? (() => new Date().toISOString());
   }
 
   async listBookReviews(input: ReviewListQuery): Promise<CursorPage<Review>> {
@@ -205,6 +241,74 @@ export class FirestoreReviewGateway implements ReviewGateway {
       content: input.content,
       containsSpoilers: input.containsSpoilers,
       updatedAt: input.updatedAt
+    });
+  }
+
+  /**
+   * Creates or retires the reader's helpful vote, atomically.
+   *
+   * The Phase 1 security rule authorises a `likesCount` step only when the
+   * acting reader's own `/reviewLikes/{reviewId}_{uid}` row appears (for `+1`)
+   * or disappears (for `-1`) *in the same commit*: the rule resolves `exists()`
+   * against the post-commit state, so two sequential writes can never satisfy it
+   * — the counter write arrives before the like row and is denied. Both writes
+   * therefore share one transaction.
+   *
+   * The counter is read inside the transaction and written back as a literal
+   * rather than a `FieldValue.increment`, which keeps the value the rule compares
+   * against `resource.data.likesCount` unambiguous, and turns the read into
+   * conflict detection: a concurrent vote from another tab retries against the
+   * new base instead of both callers stepping the same stale number.
+   *
+   * Whether the caller had already voted is answered by the like document, not
+   * by the caller. The feeds never hydrate `/reviewLikes`, so a client's memory
+   * of "did I vote?" is only a hint and the transaction is the authority.
+   */
+  async toggleHelpfulVote(reviewId: string): Promise<HelpfulVoteResult> {
+    const userId = this.#currentUserId();
+    if (userId === null) {
+      throw new WriteRejectedError('Sign in to vote a review helpful.', 'reviewLikes/signed-out');
+    }
+
+    const reviewRef = doc(this.#db, REVIEW_COLLECTION, reviewId);
+    const likeRef = doc(this.#db, REVIEW_LIKE_COLLECTION, likeIdFor(reviewId, userId));
+
+    return runTransaction(this.#db, async (transaction) => {
+      // The review is read first: its absence means the vote has nowhere to
+      // land, and the rule would deny the like row anyway (DATA-01).
+      const reviewSnapshot = await transaction.get(reviewRef);
+      if (!reviewSnapshot.exists()) {
+        throw new WriteRejectedError(
+          'That review is no longer available to vote on.',
+          'reviews/not-found'
+        );
+      }
+
+      const likeSnapshot = await transaction.get(likeRef);
+      const storedLikes = reviewSnapshot.data()?.likesCount;
+      const likesCount = typeof storedLikes === 'number' ? storedLikes : 0;
+
+      if (likeSnapshot.exists()) {
+        transaction.delete(likeRef);
+        // A counter that is already zero is left untouched: the row still goes,
+        // but a `0 -> 0` write is neither a `+1` nor a `-1` step, and the rule
+        // would reject it as an arbitrary change.
+        if (likesCount <= 0) return { voted: false, likesCount: 0 };
+
+        transaction.update(reviewRef, { likesCount: likesCount - 1 });
+        return { voted: false, likesCount: likesCount - 1 };
+      }
+
+      const like: ReviewLike = {
+        id: likeRef.id,
+        reviewId,
+        userId,
+        createdAt: this.#now()
+      };
+
+      transaction.set(likeRef, like);
+      transaction.update(reviewRef, { likesCount: likesCount + 1 });
+      return { voted: true, likesCount: likesCount + 1 };
     });
   }
 
