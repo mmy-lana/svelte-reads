@@ -8,6 +8,7 @@
   import { CATALOG_SORT_OPTIONS, searchStore } from '$lib/state/search.svelte';
   import { catalogStore } from '$lib/state/catalog.svelte';
   import { shelfStore } from '$lib/state/shelf.svelte';
+  import { applySearchParams } from '$lib/utils/search-params';
   import { countLabel } from '$lib/utils/format';
   import { RATING_BOUNDS } from '$lib/utils/ratings';
   import type { Book, BookSortField, SortDirection } from '$lib/types/domain';
@@ -32,19 +33,7 @@
   let mirroredSearch = $state<string | null>(null);
 
   function applyParams(search: URLSearchParams): void {
-    searchStore.setQuery(search.get('q') ?? '');
-    searchStore.setGenre(search.get('genre') ?? '');
-
-    const minRating = Number.parseInt(search.get('rating') ?? '', 10);
-    searchStore.setMinRating(Number.isFinite(minRating) ? minRating : 0);
-
-    const sort = search.get('sort');
-    const direction = search.get('dir');
-    if (sort) {
-      searchStore.setSortOption(
-        `${sort}:${direction === 'asc' || direction === 'desc' ? direction : 'desc'}`
-      );
-    }
+    applySearchParams(search, searchStore);
   }
 
   $effect(() => {

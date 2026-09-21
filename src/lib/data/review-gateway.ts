@@ -360,11 +360,20 @@ export class FirestoreReviewGateway implements ReviewGateway {
       const isFinalPass = dependents.length < CASCADE_CHUNK_SIZE;
 
       await runTransaction(this.#db, async (transaction) => {
+        // Firestore transactions require all reads to precede all writes.
+        const bookSnapshot = isFinalPass ? await transaction.get(bookRef) : null;
+
         for (const dependent of dependents) transaction.delete(dependent);
 
         if (!isFinalPass) return;
         transaction.delete(reviewRef);
-        transaction.update(bookRef, { reviewsCount: increment(-1) });
+
+        if (bookSnapshot && bookSnapshot.exists()) {
+          const currentReviews = bookSnapshot.data()?.reviewsCount;
+          const safeReviewsCount =
+            typeof currentReviews === 'number' ? Math.max(0, currentReviews - 1) : 0;
+          transaction.update(bookRef, { reviewsCount: safeReviewsCount });
+        }
       });
 
       if (isFinalPass) return;

@@ -168,6 +168,12 @@ export class SearchStore {
     return this.activeFilterCount === 0;
   }
 
+  /** Applies multiple filter changes in one batch to prevent cascading query bursts. */
+  applyFilters(changes: Partial<BookSearchFilters>, debounce = false): void {
+    this.filters = { ...this.filters, ...changes };
+    this.#schedule(debounce ? this.#debounceMs : 0);
+  }
+
   /** Debounced query update, used by the search field on every keystroke. */
   setQuery(query: string): void {
     this.filters.query = query;

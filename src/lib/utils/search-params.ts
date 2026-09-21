@@ -20,6 +20,7 @@ export interface FilterApplier {
   setGenre(genre: string): void;
   setMinRating(minRating: number): void;
   setSortOption(option: string): void;
+  applyFilters?(filters: Partial<BookSearchFilters>): void;
 }
 
 /**
@@ -30,16 +31,33 @@ export interface FilterApplier {
  * sensibly, not break the page.
  */
 export function applySearchParams(search: URLSearchParams, applier: FilterApplier): void {
-  applier.setQuery(search.get('q') ?? '');
-  applier.setGenre(search.get('genre') ?? '');
-
-  const minRating = Number.parseInt(search.get('rating') ?? '', 10);
-  applier.setMinRating(Number.isFinite(minRating) ? minRating : 0);
-
+  const query = search.get('q') ?? '';
+  const genre = search.get('genre') ?? '';
+  const parsedRating = Number.parseInt(search.get('rating') ?? '', 10);
+  const minRating = Number.isFinite(parsedRating) ? parsedRating : 0;
   const sort = search.get('sort');
+  const direction = search.get('dir');
+
+  if (typeof applier.applyFilters === 'function') {
+    const partial: Partial<BookSearchFilters> = {
+      query,
+      genre,
+      minRating
+    };
+    if (sort) {
+      partial.sortBy = sort as BookSortField;
+      partial.sortDirection = direction === 'asc' || direction === 'desc' ? direction : 'desc';
+    }
+    applier.applyFilters(partial);
+    return;
+  }
+
+  applier.setQuery(query);
+  applier.setGenre(genre);
+  applier.setMinRating(minRating);
+
   if (!sort) return;
 
-  const direction = search.get('dir');
   applier.setSortOption(
     `${sort}:${direction === 'asc' || direction === 'desc' ? direction : 'desc'}`
   );
