@@ -217,9 +217,25 @@ service cloud.firestore {
           && request.resource.data.reviewId == reviewId
           && request.resource.data.content is string
           && request.resource.data.content.size() > 0
-          && request.resource.data.content.size() <= 2000;
+          && request.resource.data.content.size() <= 2000
+          // DATA-01: engagement may only attach to a review that still exists.
+          // Without this, a comment racing a review deletion would land on a
+          // deleted review and be unreachable forever.
+          && exists(/databases/$(database)/documents/reviews/$(reviewId));
         allow update: if isAuthenticated() && resource.data.userId == request.auth.uid;
-        allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+        // DATA-01: a comment author may retract their own comment, and the review
+        // author may retire the whole thread when they delete the review. The
+        // client cascade removes these rows in the passes that precede the review
+        // document's own deletion, so this clause is what makes the cascade
+        // possible at all: without it the review author could not remove comments
+        // left by other readers, and those rows would outlive the review as
+        // orphans. The parent lookup is defensive — a review deleted by another
+        // client in the meantime yields no data, which denies rather than errors.
+        allow delete: if isAuthenticated()
+          && (
+            resource.data.userId == request.auth.uid
+            || get(/databases/$(database)/documents/reviews/$(reviewId)).data.get('userId', '') == request.auth.uid
+          );
       }
     }
 
@@ -231,8 +247,18 @@ service cloud.firestore {
       allow create: if isAuthenticated()
         && request.resource.data.userId == request.auth.uid
         && request.resource.data.reviewId is string
-        && likeId == request.resource.data.reviewId + '_' + request.auth.uid;
-      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+        && likeId == request.resource.data.reviewId + '_' + request.auth.uid
+        // DATA-01: a like may only attach to a review that still exists.
+        && exists(/databases/$(database)/documents/reviews/$(request.resource.data.reviewId));
+      // DATA-01: a reader may retract their own like, and the review author may
+      // retire every like on their review when the review itself is deleted.
+      // The cascade runs under the review author's session, so without the second
+      // clause a like by another reader could never be removed with its review.
+      allow delete: if isAuthenticated()
+        && (
+          resource.data.userId == request.auth.uid
+          || get(/databases/$(database)/documents/reviews/$(resource.data.reviewId)).data.get('userId', '') == request.auth.uid
+        );
     }
   }
 }

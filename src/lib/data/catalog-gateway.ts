@@ -75,7 +75,18 @@ export class FirestoreCatalogGateway implements CatalogGateway {
 
     if (input.cursorId) {
       const cursor = await getDoc(doc(this.#db, BOOK_COLLECTION, input.cursorId));
-      if (cursor.exists()) constraints.push(startAfter(cursor));
+
+      // CONC-02: a cursor document that no longer exists (deleted or re-keyed
+      // between pages) must NOT be silently dropped. Dropping the constraint
+      // restarts the scan at page 1, so `SearchStore.#collectMatches` would keep
+      // receiving page 1 with `hasMore: true` and never terminate. Report an
+      // exhausted, terminal page instead: the caller stops paging, and the
+      // in-memory results already collected stay on screen.
+      if (!cursor.exists()) {
+        return { items: [], nextCursorId: null, hasMore: false };
+      }
+
+      constraints.push(startAfter(cursor));
     }
 
     constraints.push(limitTo(pageSize + 1));

@@ -46,12 +46,25 @@ import type {
 
 export type ShelfCounts = Record<ShelfTabValue, number>;
 
+/**
+ * Window during which a completed refresh counts as fresh enough to satisfy
+ * another refresh request. The layout shell and a route such as `/my-books` both
+ * refresh on the same navigation cycle; without this, the second call re-issues
+ * an identical query. It is deliberately short: navigating back much later still
+ * refetches, and the explicit "Try again" path calls `invalidate()` first.
+ */
+const REFRESH_FRESHNESS_MS = 2_000;
+
 export interface ShelfStoreOptions {
   gateway?: ShelfGateway;
   /** Resolves the signed-in reader; injectable so tests need no Firebase app. */
   currentUser?: () => AuthUser | null;
   now?: () => string;
   pageSize?: number;
+  /** Freshness window in milliseconds; defaults to `REFRESH_FRESHNESS_MS`. */
+  refreshFreshnessMs?: number;
+  /** Clock used for the freshness window; injectable for deterministic tests. */
+  monotonicNow?: () => number;
 }
 
 /** Projects the fields the shelf row denormalises from the catalog document. */
@@ -103,12 +116,23 @@ export class ShelfStore {
   #clock: ShelfClock;
   #pageSize: number;
   #cursor: string | null = null;
+  /**
+   * In-flight load promises keyed by request kind. Concurrent callers for the
+   * same kind share one round trip instead of racing duplicate queries.
+   */
+  #inFlight = new Map<'refresh' | 'page', Promise<void>>();
+  #refreshFreshnessMs: number;
+  #monotonicNow: () => number;
+  #lastRefreshedAt: number | null = null;
+  #lastRefreshUid: string | null = null;
 
   constructor(options: ShelfStoreOptions = {}) {
     this.#gateway = options.gateway ?? new FirestoreShelfGateway();
     this.#currentUser = options.currentUser ?? (() => authState.user);
     this.#clock = { now: options.now ?? (() => new Date().toISOString()) };
     this.#pageSize = options.pageSize ?? DEFAULT_SHELF_PAGE_SIZE;
+    this.#refreshFreshnessMs = options.refreshFreshnessMs ?? REFRESH_FRESHNESS_MS;
+    this.#monotonicNow = options.monotonicNow ?? (() => Date.now());
   }
 
   /** Rows per shelf tab, used by the dashboard counters. */
@@ -165,34 +189,90 @@ export class ShelfStore {
     this.#cursor = null;
     this.hasMore = false;
     this.error = null;
+    this.#inFlight.clear();
+    this.#lastRefreshedAt = null;
+    this.#lastRefreshUid = null;
   }
 
-  /** Loads the first page of shelf rows, or refreshes them in place. */
-  async loadShelves(options: { refresh?: boolean } = {}): Promise<void> {
+  /**
+   * Marks cached shelves stale so the next `loadShelves({ refresh: true })`
+   * always refetches. Used by explicit retry affordances, which must not be
+   * short-circuited by the freshness window.
+   */
+  invalidate(): void {
+    this.#lastRefreshedAt = null;
+    this.#lastRefreshUid = null;
+  }
+
+  /**
+   * Loads the first page of shelf rows, or refreshes them in place.
+   *
+   * Concurrency contract (CONC-01):
+   *   - concurrent callers of the same kind share a single in-flight promise, so
+   *     the layout shell and a route mounting in the same cycle produce one
+   *     query rather than two;
+   *   - a refresh merges into the cache instead of clearing it, so a row with an
+   *     optimistic mutation still in flight is never blanked out mid-write;
+   *   - a refresh that completes and is followed by another refresh inside the
+   *     freshness window is served from the cache.
+   *
+   * Deliberately not `async`: an `async` wrapper would mint a fresh promise per
+   * caller, so concurrent callers would share the round trip but not the
+   * promise identity. Returning the stored promise directly makes the
+   * deduplication observable and exact.
+   */
+  loadShelves(options: { refresh?: boolean } = {}): Promise<void> {
     const user = this.#currentUser();
     if (!user) {
       this.clear();
-      return;
+      return Promise.resolve();
     }
 
-    const previousCursor = options.refresh ? null : this.#cursor;
+    const refresh = options.refresh === true;
+    const kind = refresh ? 'refresh' : 'page';
+
+    const running = this.#inFlight.get(kind);
+    if (running) return running;
+
+    // A refresh is always allowed through: it is the documented way to recover
+    // from a failed or stuck page read, and it carries its own in-flight slot.
+    if (refresh && this.#isFreshRefresh(user.uid)) return Promise.resolve();
+
+    const request = this.#loadShelves(user.uid, refresh).finally(() => {
+      if (this.#inFlight.get(kind) === request) this.#inFlight.delete(kind);
+    });
+
+    this.#inFlight.set(kind, request);
+    return request;
+  }
+
+  /** True when a completed refresh for this reader is still inside the window. */
+  #isFreshRefresh(uid: string): boolean {
+    if (this.#refreshFreshnessMs <= 0) return false;
+    if (this.#lastRefreshedAt === null || this.#lastRefreshUid !== uid) return false;
+    return this.#monotonicNow() - this.#lastRefreshedAt < this.#refreshFreshnessMs;
+  }
+
+  async #loadShelves(uid: string, refresh: boolean): Promise<void> {
+    const previousCursor = refresh ? null : this.#cursor;
     this.isLoading = true;
     this.error = null;
 
     try {
       const page = await retryRead(() =>
         this.#gateway.listShelves({
-          userId: user.uid,
+          userId: uid,
           pageSize: this.#pageSize,
           cursorId: previousCursor
         })
       );
 
-      if (options.refresh || previousCursor === null) this.shelves.clear();
-      for (const record of page.items) this.shelves.set(record.bookId, record);
+      this.#mergePage(page.items, refresh || previousCursor === null);
 
       this.#cursor = page.nextCursorId;
       this.hasMore = page.hasMore;
+      this.#lastRefreshedAt = this.#monotonicNow();
+      this.#lastRefreshUid = uid;
     } catch (error) {
       this.error = describeReadFailure(error, 'We could not load your shelves.');
     } finally {
@@ -200,10 +280,39 @@ export class ShelfStore {
     }
   }
 
-  /** Fetches the next page using the cursor returned by the previous one. */
-  async loadMore(): Promise<void> {
-    if (!this.hasMore || this.isLoading || this.#cursor === null) return;
-    await this.loadShelves();
+  /**
+   * Folds a fetched page into the cache.
+   *
+   * A first page replaces the cached window, but rows whose write is still in
+   * flight keep their optimistic value: the server response predates the
+   * mutation, so overwriting it would visibly revert the reader's own change
+   * until the write settles.
+   */
+  #mergePage(items: UserBookShelf[], replacesWindow: boolean): void {
+    if (replacesWindow) {
+      for (const bookId of [...this.shelves.keys()]) {
+        if (!this.pending.has(bookId)) this.shelves.delete(bookId);
+      }
+    }
+
+    for (const record of items) {
+      if (replacesWindow && this.pending.has(record.bookId)) continue;
+      this.shelves.set(record.bookId, record);
+    }
+  }
+
+  /**
+   * Fetches the next page using the cursor returned by the previous one.
+   *
+   * Not `async` for the same reason as `loadShelves`: concurrent taps must
+   * receive the identical in-flight promise so only one page is appended. The
+   * `hasMore`/cursor guards live here, while the in-flight check lives inside
+   * `loadShelves` so a racing tap cannot short-circuit past the shared request.
+   */
+  loadMore(): Promise<void> {
+    if (!this.hasMore || this.#cursor === null) return Promise.resolve();
+    // Shares the `page` in-flight key, so repeated taps append exactly one page.
+    return this.loadShelves({ refresh: false });
   }
 
   /** Moves a book onto a shelf, creating the row on first shelving. */

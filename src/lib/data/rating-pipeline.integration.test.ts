@@ -40,10 +40,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   BOOK_COLLECTION,
   FirestoreShelfGateway,
+  REVIEW_COLLECTION,
   SHELF_COLLECTION,
   USER_COLLECTION
 } from '$lib/data/shelf-gateway';
-import { FirestoreReviewGateway } from '$lib/data/review-gateway';
+import { FirestoreReviewGateway, REVIEW_COMMENT_COLLECTION, REVIEW_LIKE_COLLECTION } from '$lib/data/review-gateway';
 import { DuplicateReviewError } from '$lib/data/errors';
 import { checkEmulatorSuite } from '$lib/firebase/emulator-health';
 import { resolveEmulatorConfig, resolveFirebaseWebConfig } from '$lib/firebase/config';
@@ -93,9 +94,9 @@ let db: Firestore;
 let shelfGateway: FirestoreShelfGateway;
 let reviewGateway: FirestoreReviewGateway;
 
-function emptyBook(): Book {
+function emptyBook(id: string = bookId): Book {
   return {
-    id: bookId,
+    id,
     isbn13: '9780140187394',
     isbn10: '0140187397',
     title: 'Pipeline Test Edition',
@@ -193,10 +194,10 @@ function ratingRecord(
   };
 }
 
-function reviewDocument(): Review {
+function reviewDocument(book: string = bookId): Review {
   return {
-    id: `${readerTwo.uid}_${bookId}`,
-    bookId,
+    id: `${readerTwo.uid}_${book}`,
+    bookId: book,
     bookTitle: 'Pipeline Test Edition',
     bookCoverUrl: '',
     userId: readerTwo.uid,
@@ -228,7 +229,12 @@ beforeAll(async () => {
   connectFirestoreEmulator(db, emulatorConfig.host, emulatorConfig.ports.firestore);
 
   shelfGateway = new FirestoreShelfGateway({ firestore: db });
-  reviewGateway = new FirestoreReviewGateway({ firestore: db });
+  // The gateway asserts review ownership against the acting session, so the
+  // suite's own Auth instance is injected rather than the module singleton.
+  reviewGateway = new FirestoreReviewGateway({
+    firestore: db,
+    currentUserId: () => auth.currentUser?.uid ?? null
+  });
 
   // The catalog document is created by an authenticated reader, exactly like the
   // shipped security rules require.
@@ -428,6 +434,160 @@ describe('review pipeline on the emulator', () => {
 
     // Deleting an absent review is a no-op rather than an error.
     await expect(reviewGateway.deleteReview(`${readerTwo.uid}_${bookId}`)).resolves.toBeUndefined();
+  });
+});
+
+// DATA-01: deleting a review must not strand the engagement that pointed at it.
+describe('review cascade on the emulator', () => {
+  /** Each case owns a private catalog document so leftovers cannot collide. */
+  async function seedBook(suffix: string): Promise<string> {
+    const id = `${runId}-${suffix}`;
+    await setDoc(doc(db, BOOK_COLLECTION, id), emptyBook(id));
+    return id;
+  }
+
+  it('removes the review, its likes, and its comments', async () => {
+    const cascadeBookId = await seedBook('cascade');
+    await signIn(readerTwo);
+    const reviewId = `${readerTwo.uid}_${cascadeBookId}`;
+    await reviewGateway.createReview(reviewDocument(cascadeBookId));
+
+    // readerOne likes the review and comments on it, so the cascade has to
+    // retire documents owned by a *different* reader.
+    await signIn(readerOne);
+    const likeId = `${reviewId}_${readerOne.uid}`;
+    await setDoc(doc(db, REVIEW_LIKE_COLLECTION, likeId), {
+      id: likeId,
+      reviewId,
+      userId: readerOne.uid,
+      createdAt: now
+    });
+    await setDoc(doc(db, REVIEW_COLLECTION, reviewId, REVIEW_COMMENT_COLLECTION, 'comment-1'), {
+      id: 'comment-1',
+      reviewId,
+      userId: readerOne.uid,
+      userDisplayName: 'Reader One',
+      content: 'A comment that must not outlive its review.',
+      createdAt: now,
+      updatedAt: now
+    });
+
+    // The review author's own comment, to prove both owners are handled.
+    await signIn(readerTwo);
+    await setDoc(doc(db, REVIEW_COLLECTION, reviewId, REVIEW_COMMENT_COLLECTION, 'comment-2'), {
+      id: 'comment-2',
+      reviewId,
+      userId: readerTwo.uid,
+      userDisplayName: 'Reader Two',
+      content: 'The author replying to their own review thread.',
+      createdAt: now,
+      updatedAt: now
+    });
+
+    expect((await getDoc(doc(db, REVIEW_LIKE_COLLECTION, likeId))).exists()).toBe(true);
+
+    await reviewGateway.deleteReview(reviewId);
+
+    expect((await getDoc(doc(db, REVIEW_COLLECTION, reviewId))).exists()).toBe(false);
+    expect((await getDoc(doc(db, REVIEW_LIKE_COLLECTION, likeId))).exists()).toBe(false);
+    expect(
+      (await getDoc(doc(db, REVIEW_COLLECTION, reviewId, REVIEW_COMMENT_COLLECTION, 'comment-1')))
+        .exists()
+    ).toBe(false);
+    expect(
+      (await getDoc(doc(db, REVIEW_COLLECTION, reviewId, REVIEW_COMMENT_COLLECTION, 'comment-2')))
+        .exists()
+    ).toBe(false);
+
+    // The counter is decremented exactly once — by the final pass, which is the
+    // only pass that removes the review document.
+    const book = (await getDoc(doc(db, BOOK_COLLECTION, cascadeBookId))).data() as Book;
+    expect(book.reviewsCount).toBe(0);
+  });
+
+  it('refuses a non-author cascade and keeps a stranger comment undeletable', async () => {
+    const foreignBookId = await seedBook('cascade-foreign');
+    await signIn(readerTwo);
+    const reviewId = `${readerTwo.uid}_${foreignBookId}`;
+    await reviewGateway.createReview(reviewDocument(foreignBookId));
+
+    // readerOne writes a comment on readerTwo's review and likes it.
+    await signIn(readerOne);
+    const foreignComment = doc(
+      db,
+      REVIEW_COLLECTION,
+      reviewId,
+      REVIEW_COMMENT_COLLECTION,
+      'comment-foreign'
+    );
+    await setDoc(foreignComment, {
+      id: 'comment-foreign',
+      reviewId,
+      userId: readerOne.uid,
+      userDisplayName: 'Reader One',
+      content: 'A third-party comment on someone else review.',
+      createdAt: now,
+      updatedAt: now
+    });
+    const likeId = `${reviewId}_${readerOne.uid}`;
+    await setDoc(doc(db, REVIEW_LIKE_COLLECTION, likeId), {
+      id: likeId,
+      reviewId,
+      userId: readerOne.uid,
+      createdAt: now
+    });
+
+    // readerOne is not the review author, so the cascade fails closed with a
+    // typed rejection before any document is touched.
+    await expect(reviewGateway.deleteReview(reviewId)).rejects.toMatchObject({
+      code: 'reviews/not-author'
+    });
+    expect((await getDoc(doc(db, REVIEW_COLLECTION, reviewId))).exists()).toBe(true);
+    expect((await getDoc(doc(db, REVIEW_LIKE_COLLECTION, likeId))).exists()).toBe(true);
+
+    // A comment author may always retract their own comment.
+    await expect(deleteDoc(foreignComment)).resolves.toBeUndefined();
+
+    // readerTwo owns the review, so their cascade retires readerOne's like.
+    await signIn(readerTwo);
+    await reviewGateway.deleteReview(reviewId);
+
+    expect((await getDoc(doc(db, REVIEW_COLLECTION, reviewId))).exists()).toBe(false);
+    expect((await getDoc(doc(db, REVIEW_LIKE_COLLECTION, likeId))).exists()).toBe(false);
+  });
+
+  it('refuses new engagement against a review that has been deleted', async () => {
+    const closedBookId = await seedBook('cascade-closed');
+    await signIn(readerTwo);
+    const reviewId = `${readerTwo.uid}_${closedBookId}`;
+    await reviewGateway.createReview(reviewDocument(closedBookId));
+    await reviewGateway.deleteReview(reviewId);
+    expect((await getDoc(doc(db, REVIEW_COLLECTION, reviewId))).exists()).toBe(false);
+
+    // DATA-01: engagement must not be able to attach to a review that is gone —
+    // such a row would be unreachable and permanently undeletable.
+    await signIn(readerOne);
+    await expect(
+      setDoc(doc(db, REVIEW_COLLECTION, reviewId, REVIEW_COMMENT_COLLECTION, 'late-comment'), {
+        id: 'late-comment',
+        reviewId,
+        userId: readerOne.uid,
+        userDisplayName: 'Reader One',
+        content: 'A comment racing a deletion.',
+        createdAt: now,
+        updatedAt: now
+      })
+    ).rejects.toMatchObject({ code: 'permission-denied' });
+
+    const lateLikeId = `${reviewId}_${readerOne.uid}`;
+    await expect(
+      setDoc(doc(db, REVIEW_LIKE_COLLECTION, lateLikeId), {
+        id: lateLikeId,
+        reviewId,
+        userId: readerOne.uid,
+        createdAt: now
+      })
+    ).rejects.toMatchObject({ code: 'permission-denied' });
   });
 });
 

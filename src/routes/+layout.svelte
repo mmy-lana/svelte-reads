@@ -38,6 +38,9 @@
     void (async () => {
       try {
         await authState.whenReady();
+        // The store deduplicates concurrent refreshes, so a route mounting in
+        // this same navigation cycle shares this request instead of issuing a
+        // second identical query.
         await shelfStore.loadShelves({ refresh: true });
       } catch {
         // The stores already expose reader-facing error state; the shell must not

@@ -5,6 +5,7 @@
   import EmptyState from '$lib/components/shells/EmptyState.svelte';
   import { authState } from '$lib/state/auth.svelte';
   import { shelfStore } from '$lib/state/shelf.svelte';
+  import { readingGoalTarget } from '$lib/utils/profile';
   import { countLabel, formatNumber } from '$lib/utils/format';
 
   /**
@@ -39,8 +40,13 @@
   const goalTarget = $derived(Number.parseInt(goalDraft, 10));
 
   $effect(() => {
-    const target = profile?.readingGoal.targetBooks;
-    if (typeof target === 'number' && goalDraft === '') goalDraft = String(target);
+    // DEF-01: seed the goal input from the loaded profile. The read is extracted
+    // into `readingGoalTarget` because `readingGoal` is optional at runtime even
+    // though the schema requires it — a legacy document written before the field
+    // existed, or an optimistic sign-up write, arrives without it, and the
+    // original `profile?.readingGoal.targetBooks` threw on `undefined.targetBooks`.
+    const target = readingGoalTarget(profile);
+    if (target !== null && goalDraft === '') goalDraft = String(target);
   });
 
   async function submitCredentials(event: SubmitEvent): Promise<void> {

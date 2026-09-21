@@ -300,3 +300,182 @@ describe('ShelfStore aggregation and browsing', () => {
     expect(store.hasMore).toBe(false);
   });
 });
+
+// CONC-01: the layout shell and a route both refresh on the same navigation
+// cycle, and a refresh must never blank out a row whose write is still running.
+describe('ShelfStore loadShelves concurrency (CONC-01)', () => {
+  function concurrentHarness(): {
+    store: ShelfStore;
+    gateway: FakeShelfGateway;
+    advance: (ms: number) => void;
+  } {
+    const gateway = new FakeShelfGateway();
+    let clock = 1_000;
+    const store = createShelfStore({
+      gateway,
+      currentUser: () => makeUser(),
+      now: () => FIXED_NOW,
+      monotonicNow: () => clock
+    });
+    return { store, gateway, advance: (ms: number) => (clock += ms) };
+  }
+
+  it('shares one in-flight refresh between concurrent callers', async () => {
+    const { store, gateway } = concurrentHarness();
+    gateway.pages = [
+      {
+        items: [makeShelfRecord({ bookId: 'a' })],
+        nextCursorId: null,
+        hasMore: false
+      }
+    ];
+    const gate = createDeferred<void>();
+    const originalListShelves = gateway.listShelves.bind(gateway);
+    gateway.listShelves = async (input) => {
+      await gate.promise;
+      return originalListShelves(input);
+    };
+
+    const first = store.loadShelves({ refresh: true });
+    const second = store.loadShelves({ refresh: true });
+    const third = store.loadShelves({ refresh: true });
+
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+
+    gate.resolve();
+    await Promise.all([first, second, third]);
+
+    // Three callers, one query.
+    expect(gateway.listQueries).toHaveLength(1);
+    expect(store.counts.all).toBe(1);
+  });
+
+  it('issues a fresh query once the in-flight refresh has settled', async () => {
+    const { store, gateway, advance } = concurrentHarness();
+    gateway.pages = [
+      { items: [makeShelfRecord({ bookId: 'a' })], nextCursorId: null, hasMore: false }
+    ];
+
+    await store.loadShelves({ refresh: true });
+    expect(gateway.listQueries).toHaveLength(1);
+
+    // Inside the freshness window a second refresh reuses the completed load,
+    // which is what collapses the layout + route double refresh.
+    await store.loadShelves({ refresh: true });
+    expect(gateway.listQueries).toHaveLength(1);
+
+    // Past the window the reader gets genuinely fresh data again.
+    advance(5_000);
+    await store.loadShelves({ refresh: true });
+    expect(gateway.listQueries).toHaveLength(2);
+  });
+
+  it('lets an explicit invalidate force a refetch inside the window', async () => {
+    const { store, gateway } = concurrentHarness();
+    gateway.pages = [
+      { items: [makeShelfRecord({ bookId: 'a' })], nextCursorId: null, hasMore: false }
+    ];
+
+    await store.loadShelves({ refresh: true });
+    store.invalidate();
+    await store.loadShelves({ refresh: true });
+
+    expect(gateway.listQueries).toHaveLength(2);
+  });
+
+  it('keeps an in-flight optimistic mutation across a refresh', async () => {
+    const { store, gateway } = concurrentHarness();
+    const book = makeBook();
+
+    // The reader has an optimistic `read` write in flight...
+    const gate = createDeferred<void>();
+    gateway.hold = gate;
+    const write = store.setStatus(book, 'read');
+    expect(store.statusFor(book.id)).toBe('read');
+    expect(store.isPending(book.id)).toBe(true);
+
+    // ...and a refresh lands carrying the stale server value.
+    gateway.hold = null;
+    gateway.pages = [
+      {
+        items: [makeShelfRecord({ bookId: book.id, status: 'want-to-read' })],
+        nextCursorId: null,
+        hasMore: false
+      }
+    ];
+    await store.loadShelves({ refresh: true });
+
+    // The optimistic status survives; the refresh did not revert the UI.
+    expect(store.statusFor(book.id)).toBe('read');
+
+    gate.resolve();
+    await write;
+    expect(store.statusFor(book.id)).toBe('read');
+    expect(store.isPending(book.id)).toBe(false);
+  });
+
+  it('still replaces rows that have no write in flight', async () => {
+    const { store, gateway } = concurrentHarness();
+    const stale = makeShelfRecord({ bookId: 'a', status: 'want-to-read' });
+    store.shelves.set(stale.bookId, stale);
+
+    gateway.pages = [
+      {
+        items: [makeShelfRecord({ bookId: 'a', status: 'read' })],
+        nextCursorId: null,
+        hasMore: false
+      }
+    ];
+    await store.loadShelves({ refresh: true });
+
+    expect(store.statusFor('a')).toBe('read');
+  });
+
+  it('drops rows the server no longer returns once they are settled', async () => {
+    const { store, gateway } = concurrentHarness();
+    store.shelves.set('gone', makeShelfRecord({ bookId: 'gone' }));
+
+    gateway.pages = [
+      { items: [makeShelfRecord({ bookId: 'kept' })], nextCursorId: null, hasMore: false }
+    ];
+    await store.loadShelves({ refresh: true });
+
+    expect(store.list.map((row) => row.bookId)).toEqual(['kept']);
+  });
+
+  it('coalesces concurrent loadMore calls into a single page append', async () => {
+    const { store, gateway } = concurrentHarness();
+    gateway.pages = [
+      {
+        items: [makeShelfRecord({ bookId: 'a' })],
+        nextCursorId: 'reader-1_a',
+        hasMore: true
+      },
+      {
+        items: [makeShelfRecord({ bookId: 'b' })],
+        nextCursorId: null,
+        hasMore: false
+      }
+    ];
+
+    await store.loadShelves({ refresh: true });
+
+    const gate = createDeferred<void>();
+    const originalListShelves = gateway.listShelves.bind(gateway);
+    gateway.listShelves = async (input) => {
+      await gate.promise;
+      return originalListShelves(input);
+    };
+
+    const first = store.loadMore();
+    const second = store.loadMore();
+    expect(second).toBe(first);
+
+    gate.resolve();
+    await Promise.all([first, second]);
+
+    expect(gateway.listQueries).toHaveLength(2);
+    expect(store.list.map((row) => row.bookId).sort()).toEqual(['a', 'b']);
+  });
+});

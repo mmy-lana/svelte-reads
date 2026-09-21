@@ -39,6 +39,9 @@
     const uid = authState.user?.uid ?? null;
     if (!uid || requestedUser === uid) return;
     requestedUser = uid;
+    // Fired once per signed-in reader. When the layout shell already refreshed
+    // for this navigation cycle the store's in-flight/freshness guard collapses
+    // the two calls into a single query (CONC-01).
     void shelfStore.loadShelves({ refresh: true });
   });
 
@@ -219,7 +222,18 @@
   {#if shelfStore.error && !hasAnyRow}
     <EmptyState tone="warning" title="Your shelves could not be loaded" description={shelfStore.error}>
       {#snippet action()}
-        <Button variant="primary" size="sm" onclick={() => void shelfStore.loadShelves({ refresh: true })}>Try again</Button>
+        <Button
+          variant="primary"
+          size="sm"
+          onclick={() => {
+            // An explicit retry must never be short-circuited by the freshness
+            // window that collapses redundant navigation-cycle refreshes.
+            shelfStore.invalidate();
+            void shelfStore.loadShelves({ refresh: true });
+          }}
+        >
+          Try again
+        </Button>
       {/snippet}
     </EmptyState>
   {:else if isLoading && !hasAnyRow}

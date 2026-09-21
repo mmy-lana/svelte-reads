@@ -211,6 +211,43 @@ describe('SearchStore pagination', () => {
     expect(store.results).toHaveLength(0);
     expect(store.isEmpty).toBe(true);
   });
+
+  it('stops paging when the cursor points at a document that no longer exists', async () => {
+    // CONC-02: an invalid cursor makes the gateway return a terminal empty page.
+    // Before the fix the gateway silently dropped the `startAfter` constraint, so
+    // every retry returned page 1 with `hasMore: true` and this loop kept
+    // querying until it hit the `maxServerPages` ceiling — never reporting an
+    // exhausted result set.
+    gateway.pages = [
+      { items: [catalog[3]!], nextCursorId: 'dune', hasMore: true },
+      // Terminal page: the cursor document was deleted between pages.
+      { items: [], nextCursorId: null, hasMore: false }
+    ];
+    store.setQuery('steinbeck');
+    await store.flush();
+
+    // Exactly two round trips: the real page, then the terminal one.
+    expect(gateway.queries).toHaveLength(2);
+    expect(gateway.queries[1]?.cursorId).toBe('dune');
+    expect(store.serverPagesFetched).toBe(2);
+    expect(store.hasMore).toBe(false);
+    expect(store.isLoading).toBe(false);
+  });
+
+  it('does not re-query an exhausted cursor on a further loadMore', async () => {
+    gateway.pages = [
+      { items: [catalog[0]!], nextCursorId: 'gone-book', hasMore: true },
+      { items: [], nextCursorId: null, hasMore: false }
+    ];
+    store.setQuery('steinbeck');
+    await store.flush();
+
+    const queriesAfterSearch = gateway.queries.length;
+    await store.loadMore();
+
+    // `hasMore` is false, so loadMore is a no-op rather than another round trip.
+    expect(gateway.queries).toHaveLength(queriesAfterSearch);
+  });
 });
 
 describe('SearchStore query handling', () => {

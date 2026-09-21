@@ -23,6 +23,11 @@
     totalRatings
   } from '$lib/utils/ratings';
   import { countLabel, formatDate, formatNumber, formatPageCount, formatRelativeDate } from '$lib/utils/format';
+  import {
+    decideRatingSubmission,
+    ratingFailureNotice,
+    reviewPayloadFromDraft
+  } from '$lib/utils/review-submission';
   import { SHELF_STATUS_LABELS } from '$lib/utils/shelf-state-machine';
   import type { ReviewDraft, ReviewSortOption, ShelfStatus } from '$lib/types/domain';
 
@@ -40,6 +45,12 @@
   let draft = $state<ReviewDraft>({ rating: 0, title: '', content: '', containsSpoilers: false });
   let composerError = $state<string | null>(null);
   let composerStatus = $state<string | null>(null);
+  /**
+   * Set when the review half of a submission landed but the rating half did
+   * not. Kept separate from `composerError` so the warning survives the
+   * reviewer's next keystroke instead of reading as a fresh form error.
+   */
+  let ratingWarning = $state<string | null>(null);
   let isSubmittingReview = $state(false);
   let isDeletingReview = $state(false);
   let confirmDelete = $state(false);
@@ -98,6 +109,7 @@
     composerOpen = true;
     composerError = null;
     composerStatus = null;
+    ratingWarning = null;
 
     if (mode === 'edit' && ownReview) {
       draft = {
@@ -128,6 +140,11 @@
     return null;
   }
 
+  /** Prefers the typed, reader-facing message a store already produced. */
+  function describeComposerError(error: unknown, fallback: string): string {
+    return error instanceof Error && error.message.length > 0 ? error.message : fallback;
+  }
+
   async function submitReview(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     if (!book || isSubmittingReview) return;
@@ -145,32 +162,59 @@
 
     isSubmittingReview = true;
     composerError = null;
+    ratingWarning = null;
+
+    const payload = reviewPayloadFromDraft(draft);
+
+    // The shelf row is snapshotted up front: the review write refreshes the
+    // store, so reading `shelf.rating` after the await would compare the new
+    // rating against itself and skip the write.
+    const previousRating = shelf?.rating ?? 0;
+    const ratingDecision = decideRatingSubmission(payload.rating, previousRating);
+    const wasEditing = ownReview !== null;
 
     try {
-      const payload: ReviewDraft = {
-        rating: draft.rating,
-        title: draft.title.trim(),
-        content: draft.content.trim(),
-        containsSpoilers: draft.containsSpoilers
-      };
-
-      if (ownReview) {
+      if (wasEditing && ownReview) {
         await reviewStore.updateReview(book.id, ownReview.id, payload);
-        composerStatus = 'Review updated.';
       } else {
         await reviewStore.createReview(book, payload);
-        composerStatus = 'Review published.';
-      }
-
-      composerOpen = false;
-      if (payload.rating > 0 && shelf?.rating !== payload.rating) {
-        await shelfStore.submitRating(book, payload.rating).catch(() => undefined);
       }
     } catch (error) {
-      composerError =
-        error instanceof Error && error.message.length > 0
-          ? error.message
-          : 'Your review could not be saved. Try again.';
+      // The review itself failed, so nothing was persisted and nothing is
+      // half-written: keep the composer open with the draft intact.
+      composerError = describeComposerError(error, 'Your review could not be saved. Try again.');
+      isSubmittingReview = false;
+      return;
+    }
+
+    if (!ratingDecision.submit) {
+      composerOpen = false;
+      composerStatus = wasEditing ? 'Review updated.' : 'Review published.';
+      isSubmittingReview = false;
+      return;
+    }
+
+    // DATA-02: the rating is a second, independent write. It used to be fired
+    // with `.catch(() => undefined)`, which reported success while silently
+    // dropping the star rating. It is now awaited and its failure is surfaced.
+    try {
+      await shelfStore.submitRating(book, payload.rating);
+      composerOpen = false;
+      composerStatus = wasEditing
+        ? 'Review updated and your rating saved.'
+        : 'Review published and your rating saved.';
+    } catch (error) {
+      // `submitRating` rolls its own optimistic row and aggregates back before
+      // it rejects, so no partial rating survives this failure. The review is a
+      // valid standalone document and stays published; the reviewer is told
+      // exactly which half of the submission did not land.
+      composerError = ratingFailureNotice({
+        wasEditing,
+        reason: describeComposerError(error, 'your rating could not be saved')
+      });
+      ratingWarning = composerError;
+      composerOpen = true;
+      composerStatus = null;
     } finally {
       isSubmittingReview = false;
     }
@@ -184,11 +228,12 @@
       composerStatus = 'Review deleted.';
       composerOpen = false;
       confirmDelete = false;
+      ratingWarning = null;
     } catch (error) {
-      composerError =
-        error instanceof Error && error.message.length > 0
-          ? error.message
-          : 'Your review could not be deleted. Try again.';
+      composerError = describeComposerError(
+        error,
+        'Your review could not be deleted. Try again.'
+      );
     } finally {
       isDeletingReview = false;
     }
@@ -497,6 +542,18 @@
         </div>
 
         <div aria-live="polite" class="sr-only">{composerStatus ?? ''}</div>
+
+        {#if ratingWarning && !composerOpen}
+          <p
+            class="mt-4 rounded-[var(--radius-control)] border border-amber-300 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+            role="alert"
+          >
+            {ratingWarning}
+            <button type="button" class="ml-2 underline" onclick={() => (ratingWarning = null)}>
+              Dismiss
+            </button>
+          </p>
+        {/if}
 
         {#if composerOpen}
           <form
