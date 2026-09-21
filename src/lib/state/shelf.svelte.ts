@@ -12,6 +12,7 @@
  * The gateway is injectable, which is what lets the offline path be unit tested
  * deterministically instead of being hoped for.
  */
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { applyRatingMutation, calculateBayesianRating } from '$lib/utils/ratings';
 import {
   createShelfRecord,
@@ -20,7 +21,13 @@ import {
   type ShelfClock
 } from '$lib/utils/shelf-state-machine';
 import { validateProgress, validateRating } from '$lib/validation/schemas';
-import { MutationInFlightError, WriteRejectedError, describeWriteFailure } from '$lib/data/errors';
+import {
+  MutationInFlightError,
+  WriteRejectedError,
+  describeReadFailure,
+  describeWriteFailure
+} from '$lib/data/errors';
+import { retryRead } from '$lib/data/retry';
 import {
   DEFAULT_SHELF_PAGE_SIZE,
   FirestoreShelfGateway,
@@ -79,13 +86,13 @@ function emptyCounts(): ShelfCounts {
 
 export class ShelfStore {
   /** Shelf rows keyed by book id, so components look one up in O(1). */
-  shelves = $state<Map<string, UserBookShelf>>(new Map());
+  shelves = new SvelteMap<string, UserBookShelf>();
   /** Community aggregates updated by this reader's rating mutations. */
-  aggregates = $state<Map<string, BookRatingAggregates>>(new Map());
+  aggregates = new SvelteMap<string, BookRatingAggregates>();
   /** Book ids with a write in flight. */
-  pending = $state<Set<string>>(new Set());
+  pending = new SvelteSet<string>();
   /** Latest reader-facing failure per book id, cleared by the next attempt. */
-  failures = $state<Map<string, string>>(new Map());
+  failures = new SvelteMap<string, string>();
 
   isLoading = $state(false);
   hasMore = $state(false);
@@ -151,10 +158,10 @@ export class ShelfStore {
 
   /** Releases every cached row; called when the session ends. */
   clear(): void {
-    this.shelves = new Map();
-    this.aggregates = new Map();
-    this.pending = new Set();
-    this.failures = new Map();
+    this.shelves.clear();
+    this.aggregates.clear();
+    this.pending.clear();
+    this.failures.clear();
     this.#cursor = null;
     this.hasMore = false;
     this.error = null;
@@ -173,22 +180,21 @@ export class ShelfStore {
     this.error = null;
 
     try {
-      const page = await this.#gateway.listShelves({
-        userId: user.uid,
-        pageSize: this.#pageSize,
-        cursorId: previousCursor
-      });
+      const page = await retryRead(() =>
+        this.#gateway.listShelves({
+          userId: user.uid,
+          pageSize: this.#pageSize,
+          cursorId: previousCursor
+        })
+      );
 
-      if (options.refresh || previousCursor === null) {
-        this.shelves = new Map(page.items.map((record) => [record.bookId, record]));
-      } else {
-        for (const record of page.items) this.shelves.set(record.bookId, record);
-      }
+      if (options.refresh || previousCursor === null) this.shelves.clear();
+      for (const record of page.items) this.shelves.set(record.bookId, record);
 
       this.#cursor = page.nextCursorId;
       this.hasMore = page.hasMore;
     } catch (error) {
-      this.error = describeWriteFailure(error, 'We could not load your shelves.');
+      this.error = describeReadFailure(error, 'We could not load your shelves.');
     } finally {
       this.isLoading = false;
     }

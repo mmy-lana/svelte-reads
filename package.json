@@ -21,7 +21,8 @@
     "emulator:down": "docker compose down",
     "emulator:logs": "docker compose logs -f firebase-emulator",
     "emulator:seed": "node scripts/seed-emulator.ts",
-    "emulator:verify": "node scripts/verify-emulator.ts"
+    "emulator:verify": "node scripts/verify-emulator.ts",
+    "verify:shell": "node scripts/verify-shell.ts"
   },
   "dependencies": {
     "firebase": "latest",

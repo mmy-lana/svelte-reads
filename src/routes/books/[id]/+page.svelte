@@ -1,358 +1,714 @@
 <script lang="ts">
   import { page } from '$app/state';
-  import type { Book, Review, ShelfStatus } from '$lib/types/domain';
+  import Avatar from '$lib/components/atoms/Avatar.svelte';
+  import Badge from '$lib/components/atoms/Badge.svelte';
+  import Button from '$lib/components/atoms/Button.svelte';
   import RatingStars from '$lib/components/atoms/RatingStars.svelte';
+  import RatingDistributionBar from '$lib/components/molecules/RatingDistributionBar.svelte';
+  import ReadingProgressWidget from '$lib/components/molecules/ReadingProgressWidget.svelte';
   import ShelfSelector from '$lib/components/molecules/ShelfSelector.svelte';
   import SpoilerGuard from '$lib/components/molecules/SpoilerGuard.svelte';
-  import { shelfStore } from '$lib/state/shelf.svelte';
-  import { reviewStore } from '$lib/state/review.svelte';
+  import CardGridSkeleton from '$lib/components/shells/CardGridSkeleton.svelte';
+  import EmptyState from '$lib/components/shells/EmptyState.svelte';
   import { authState } from '$lib/state/auth.svelte';
+  import { catalogStore } from '$lib/state/catalog.svelte';
+  import { reviewStore } from '$lib/state/review.svelte';
+  import { shelfStore } from '$lib/state/shelf.svelte';
+  import { REVIEW_SORT_OPTIONS } from '$lib/state/review.svelte';
+  import {
+    RATING_BOUNDS,
+    bayesianFromDistribution,
+    distributionAverage,
+    formatRating,
+    totalRatings
+  } from '$lib/utils/ratings';
+  import { countLabel, formatDate, formatNumber, formatPageCount, formatRelativeDate } from '$lib/utils/format';
+  import { SHELF_STATUS_LABELS } from '$lib/utils/shelf-state-machine';
+  import type { ReviewDraft, ReviewSortOption, ShelfStatus } from '$lib/types/domain';
 
-  const bookId = $derived(page.params.id || '9780143127741');
+  /**
+   * Editorial detail page.
+   *
+   * Shows the catalog metadata, the community score with its confidence
+   * explanation, the reader's own shelf/progress/rating controls, and the review
+   * feed. Each asynchronous surface owns its loading, empty, and error state.
+   */
+  const bookId = $derived(page.params.id ?? '');
 
-  const bookData: Book = $state({
-    id: '9780143127741',
-    isbn13: '9780143127741',
-    isbn10: '0143127748',
-    title: 'East of Eden',
-    subtitle: '',
-    authors: ['John Steinbeck'],
-    publisher: 'Penguin Books',
-    publishedDate: '2014-09-02',
-    description: 'Set in the rich farmland of California\'s Salinas Valley, this sprawling and often brutal novel follows the intertwined destinies of two families.',
-    pageCount: 601,
-    genres: ['Classics', 'Fiction', 'Historical Fiction'],
-    coverUrl: 'https://images-na.ssl-images-amazon.com/images/S/compressed.photo.goodreads.com/books/1356819428i/4406.jpg',
-    thumbnailUrl: '',
-    language: 'en',
-    averageRating: 4.38,
-    bayesianRating: 4.32,
-    ratingsCount: 642100,
-    reviewsCount: 31200,
-    ratingDistribution: { 1: 12000, 2: 24000, 3: 72000, 4: 210000, 5: 324100 },
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
+  let requestedBookId = $state<string | null>(null);
+  let composerOpen = $state(false);
+  let draft = $state<ReviewDraft>({ rating: 0, title: '', content: '', containsSpoilers: false });
+  let composerError = $state<string | null>(null);
+  let composerStatus = $state<string | null>(null);
+  let isSubmittingReview = $state(false);
+  let isDeletingReview = $state(false);
+  let confirmDelete = $state(false);
+  let shelfFailure = $state<string | null>(null);
+  // One generated id per component; suffixes keep the label/control pairs unique.
+  const uid = $props.id();
+  const titleFieldId = `${uid}-review-title`;
+  const contentFieldId = `${uid}-review-content`;
+  const spoilerFieldId = `${uid}-review-spoilers`;
+  const sortFieldId = `${uid}-review-sort`;
+  const composerHeadingId = `${uid}-composer-heading`;
+
+  $effect(() => {
+    const id = bookId;
+    if (!id || requestedBookId === id) return;
+    requestedBookId = id;
+    void (async () => {
+      await catalogStore.loadBook(id);
+      await reviewStore.loadReviews(id, { refresh: true });
+    })();
   });
 
-  let reviews = $state<Review[]>([
-    {
-      id: 'demo_user_1_9780143127741',
-      bookId: '9780143127741',
-      bookTitle: 'East of Eden',
-      bookCoverUrl: 'https://images-na.ssl-images-amazon.com/images/S/compressed.photo.goodreads.com/books/1356819428i/4406.jpg',
-      userId: 'demo_user_1',
-      userDisplayName: 'Eleanor Vance',
-      userHandle: 'eleanor_v',
-      userAvatarUrl: 'https://api.dicebear.com/7.x/initials/svg?seed=Eleanor',
-      rating: 5.0,
-      title: 'A towering masterpiece of American literature',
-      content: 'Steinbeck explores free will versus predestination through the concept of Timshel. The prose is patient and evocative.',
-      containsSpoilers: false,
-      likesCount: 34,
-      commentsCount: 3,
-      tags: ['Classics'],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+  const book = $derived(bookId ? catalogStore.bookFor(bookId) : undefined);
+  const isLoadingBook = $derived(bookId ? catalogStore.isLoadingBook(bookId) : false);
+  const bookError = $derived(bookId ? catalogStore.bookError(bookId) : null);
+  const notFound = $derived(!isLoadingBook && !book && !bookError && requestedBookId === bookId);
+
+  const shelf = $derived(bookId ? shelfStore.shelfFor(bookId) : undefined);
+  const aggregates = $derived(book ? shelfStore.aggregatesFor(book) : null);
+  const reviews = $derived(bookId ? reviewStore.reviewsFor(bookId) : []);
+  const reviewsLoading = $derived(bookId ? reviewStore.isLoading(bookId) : false);
+  const reviewsError = $derived(bookId ? reviewStore.failureFor(bookId) : null);
+  const reviewsHasMore = $derived(bookId ? reviewStore.hasMore(bookId) : false);
+  const ownReview = $derived(bookId ? reviewStore.ownReview(bookId) : null);
+  const sortOption = $derived<ReviewSortOption>(bookId ? reviewStore.sortFor(bookId) : 'newest');
+  const readerRating = $derived(shelf?.rating ?? 0);
+  const ratingPending = $derived(bookId ? shelfStore.isPending(bookId) : false);
+  const ratingFailure = $derived(bookId ? shelfStore.failureFor(bookId) : null);
+
+  const distribution = $derived(aggregates?.ratingDistribution ?? book?.ratingDistribution ?? null);
+  const ratingsCount = $derived(aggregates?.ratingsCount ?? book?.ratingsCount ?? 0);
+  // `aggregatesFor` already prefers this session's optimistic values over the
+  // stored book document, so the score reflects a rating the moment it is chosen.
+  const bayesianScore = $derived(aggregates?.bayesianRating ?? book?.bayesianRating ?? 0);
+  const simpleAverage = $derived(
+    distribution
+      ? totalRatings(distribution) > 0
+        ? distributionAverage(distribution)
+        : 0
+      : (book?.averageRating ?? 0)
+  );
+  const confidenceGap = $derived(Math.max(simpleAverage - bayesianScore, 0));
+
+
+  function openComposer(mode: 'create' | 'edit'): void {
+    composerOpen = true;
+    composerError = null;
+    composerStatus = null;
+
+    if (mode === 'edit' && ownReview) {
+      draft = {
+        rating: ownReview.rating,
+        title: ownReview.title,
+        content: ownReview.content,
+        containsSpoilers: ownReview.containsSpoilers
+      };
+      return;
     }
-  ]);
 
-  const userShelf = $derived(shelfStore.shelfFor(bookData.id));
-  let isWritingReview = $state(false);
-  let reviewTitle = $state('');
-  let reviewContent = $state('');
-  let reviewRating = $state(5.0);
-  let reviewSpoiler = $state(false);
-  let isSubmitting = $state(false);
-
-  async function handleShelfChange(status: ShelfStatus) {
-    await shelfStore.setStatus(bookData, status);
+    draft = {
+      rating: readerRating > 0 ? readerRating : 0,
+      title: '',
+      content: '',
+      containsSpoilers: false
+    };
   }
 
-  async function handleRatingChange(rating: number) {
-    await shelfStore.submitRating(bookData, rating);
+  function validateDraft(): string | null {
+    if (draft.rating < RATING_BOUNDS.MIN) return 'Choose a rating between 0.5 and 5 stars.';
+    if (draft.title.trim().length < 2) return 'Give your review a title of at least 2 characters.';
+    if (draft.title.trim().length > 120) return 'Keep the title under 120 characters.';
+    if (draft.content.trim().length < 20) {
+      return 'Write at least 20 characters so readers know what you thought.';
+    }
+    if (draft.content.trim().length > 10_000) return 'Reviews are limited to 10,000 characters.';
+    return null;
   }
 
-  async function submitReview() {
-    if (!authState.user) return;
-    isSubmitting = true;
+  async function submitReview(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (!book || isSubmittingReview) return;
+
+    const problem = validateDraft();
+    if (problem) {
+      composerError = problem;
+      return;
+    }
+
+    if (!authState.user) {
+      composerError = 'Sign in to publish a review — your draft is kept below.';
+      return;
+    }
+
+    isSubmittingReview = true;
+    composerError = null;
+
     try {
-      await reviewStore.createReview(bookData, {
-        rating: reviewRating,
-        title: reviewTitle,
-        content: reviewContent,
-        containsSpoilers: reviewSpoiler
-      });
-      reviews = [
-        {
-          id: `${authState.user.uid}_${bookData.id}`,
-          bookId: bookData.id,
-          bookTitle: bookData.title,
-          bookCoverUrl: bookData.coverUrl,
-          userId: authState.user.uid,
-          userDisplayName: authState.profile?.displayName || 'Reader',
-          userHandle: authState.profile?.handle || 'reader',
-          userAvatarUrl: authState.profile?.avatarUrl || '',
-          rating: reviewRating,
-          title: reviewTitle,
-          content: reviewContent,
-          containsSpoilers: reviewSpoiler,
-          likesCount: 0,
-          commentsCount: 0,
-          tags: [],
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        },
-        ...reviews
-      ];
-      isWritingReview = false;
-      reviewTitle = '';
-      reviewContent = '';
+      const payload: ReviewDraft = {
+        rating: draft.rating,
+        title: draft.title.trim(),
+        content: draft.content.trim(),
+        containsSpoilers: draft.containsSpoilers
+      };
+
+      if (ownReview) {
+        await reviewStore.updateReview(book.id, ownReview.id, payload);
+        composerStatus = 'Review updated.';
+      } else {
+        await reviewStore.createReview(book, payload);
+        composerStatus = 'Review published.';
+      }
+
+      composerOpen = false;
+      if (payload.rating > 0 && shelf?.rating !== payload.rating) {
+        await shelfStore.submitRating(book, payload.rating).catch(() => undefined);
+      }
+    } catch (error) {
+      composerError =
+        error instanceof Error && error.message.length > 0
+          ? error.message
+          : 'Your review could not be saved. Try again.';
     } finally {
-      isSubmitting = false;
+      isSubmittingReview = false;
+    }
+  }
+
+  async function deleteReview(): Promise<void> {
+    if (!bookId || !ownReview || isDeletingReview) return;
+    isDeletingReview = true;
+    try {
+      await reviewStore.deleteReview(bookId, ownReview.id);
+      composerStatus = 'Review deleted.';
+      composerOpen = false;
+      confirmDelete = false;
+    } catch (error) {
+      composerError =
+        error instanceof Error && error.message.length > 0
+          ? error.message
+          : 'Your review could not be deleted. Try again.';
+    } finally {
+      isDeletingReview = false;
+    }
+  }
+
+  async function changeShelf(status: ShelfStatus): Promise<void> {
+    if (!book) return;
+    shelfFailure = null;
+    try {
+      await shelfStore.setStatus(book, status);
+    } catch (error) {
+      shelfFailure = shelfStore.failureFor(book.id) ?? (error instanceof Error ? error.message : 'That change could not be saved.');
+    }
+  }
+
+  async function changeRating(value: number): Promise<void> {
+    if (!book) return;
+    shelfFailure = null;
+    try {
+      await shelfStore.submitRating(book, value);
+    } catch (error) {
+      shelfFailure = shelfStore.failureFor(book.id) ?? (error instanceof Error ? error.message : 'That rating could not be saved.');
+    }
+  }
+
+  async function changeProgress(pages: number): Promise<void> {
+    if (!book) return;
+    shelfFailure = null;
+    try {
+      await shelfStore.updateProgress(book, pages);
+    } catch (error) {
+      shelfFailure = shelfStore.failureFor(book.id) ?? (error instanceof Error ? error.message : 'That progress could not be saved.');
     }
   }
 </script>
 
-<div class="space-y-8">
-  <section class="grid grid-cols-1 md:grid-cols-12 gap-8 items-start">
-    <div class="md:col-span-4 lg:col-span-3 flex flex-col items-center gap-4">
-      <div class="w-48 sm:w-56 md:w-full max-w-[260px] aspect-[2/3] rounded-xl overflow-hidden shadow-xl border border-stone-200 dark:border-stone-800 bg-stone-100 dark:bg-stone-800">
-        <img
-          src={bookData.coverUrl}
-          alt={`Cover of ${bookData.title}`}
-          class="w-full h-full object-cover"
-        />
-      </div>
+<svelte:head>
+  <title>{book ? `${book.title} — SvelteReads` : 'Book — SvelteReads'}</title>
+  <meta
+    name="description"
+    content={book
+      ? `Reviews, ratings, and community score for ${book.title} by ${book.authors.join(', ')}.`
+      : 'Book details, reviews, and ratings on SvelteReads.'}
+  />
+</svelte:head>
 
-      <div class="w-full max-w-[260px] space-y-3">
-        <ShelfSelector
-          bookId={bookData.id}
-          currentStatus={userShelf?.status}
-          onSelect={handleShelfChange}
-        />
+{#if isLoadingBook && !book}
+  <div class="flex flex-col gap-6">
+    <p class="sr-only" role="status">Loading book details…</p>
+    <div class="h-8 w-2/3 animate-pulse rounded-[var(--radius-pill)] bg-stone-200 motion-reduce:animate-none dark:bg-stone-800"></div>
+    <CardGridSkeleton count={4} label="Loading book details…" />
+  </div>
+{:else if bookError}
+  <EmptyState
+    tone="warning"
+    title="This book could not be loaded"
+    description={bookError}
+    icon="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
+  >
+    {#snippet action()}
+      <Button variant="primary" size="sm" href="/">Back to discovery</Button>
+    {/snippet}
+  </EmptyState>
+{:else if notFound || !book}
+  <EmptyState
+    title="We could not find that book"
+    description="The link may be outdated, or the title is no longer in the catalog."
+    icon="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+  >
+    {#snippet action()}
+      <Button variant="primary" size="sm" href="/search">Search the catalog</Button>
+    {/snippet}
+  </EmptyState>
+{:else}
+  <nav aria-label="Breadcrumb" class="mb-4">
+    <ol class="flex flex-wrap items-center gap-1 text-sm text-stone-500 dark:text-stone-400">
+      <li><a href="/" class="rounded-[var(--radius-control)] px-1 hover:text-stone-800 dark:hover:text-stone-100">Explore</a></li>
+      <li aria-hidden="true">/</li>
+      <li><a href="/search" class="rounded-[var(--radius-control)] px-1 hover:text-stone-800 dark:hover:text-stone-100">Catalog</a></li>
+      <li aria-hidden="true">/</li>
+      <li class="min-w-0 truncate px-1 font-medium text-stone-700 dark:text-stone-300" aria-current="page">
+        {book.title}
+      </li>
+    </ol>
+  </nav>
 
-        <div class="bg-stone-100/70 dark:bg-stone-900/70 p-3 rounded-lg border border-stone-200/60 dark:border-stone-800 text-center">
-          <span class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">
-            My Rating
-          </span>
-          <RatingStars
-            value={userShelf?.rating || 0}
-            size="md"
-            onChange={handleRatingChange}
+  <article class="grid gap-6 lg:grid-cols-[260px_1fr]">
+    <div class="flex flex-col gap-4">
+      <div class="overflow-hidden rounded-[var(--radius-card)] border border-stone-200 bg-stone-100 dark:border-stone-800 dark:bg-stone-800">
+        {#if book.coverUrl}
+          <img
+            src={book.coverUrl}
+            alt="Cover of {book.title}"
+            width={400}
+            height={600}
+            fetchpriority="high"
+            decoding="async"
+            class="h-auto w-full object-cover"
           />
-        </div>
+        {:else}
+          <div class="grid aspect-[2/3] place-items-center p-4 text-center" aria-hidden="true">
+            <span class="font-serif text-sm text-stone-600 dark:text-stone-300">{book.title}</span>
+          </div>
+        {/if}
       </div>
+
+      <dl class="grid grid-cols-2 gap-3 rounded-[var(--radius-card)] border border-stone-200 bg-white p-4 text-sm dark:border-stone-800 dark:bg-stone-900 lg:grid-cols-1">
+        <div class="min-w-0">
+          <dt class="text-xs uppercase tracking-wide text-stone-500 dark:text-stone-400">Pages</dt>
+          <dd class="font-medium tabular-nums text-stone-800 dark:text-stone-200">{formatPageCount(book.pageCount)}</dd>
+        </div>
+        <div class="min-w-0">
+          <dt class="text-xs uppercase tracking-wide text-stone-500 dark:text-stone-400">Published</dt>
+          <dd class="font-medium text-stone-800 dark:text-stone-200">{formatDate(book.publishedDate)}</dd>
+        </div>
+        <div class="min-w-0">
+          <dt class="text-xs uppercase tracking-wide text-stone-500 dark:text-stone-400">Publisher</dt>
+          <dd class="truncate font-medium text-stone-800 dark:text-stone-200">{book.publisher || 'Not recorded'}</dd>
+        </div>
+        <div class="min-w-0">
+          <dt class="text-xs uppercase tracking-wide text-stone-500 dark:text-stone-400">Language</dt>
+          <dd class="truncate font-medium text-stone-800 dark:text-stone-200">{book.language || 'Not recorded'}</dd>
+        </div>
+        <div class="col-span-2 min-w-0 lg:col-span-1">
+          <dt class="text-xs uppercase tracking-wide text-stone-500 dark:text-stone-400">ISBN-13</dt>
+          <dd class="truncate font-mono text-xs text-stone-800 dark:text-stone-200" translate="no">{book.isbn13 || 'Not recorded'}</dd>
+        </div>
+      </dl>
     </div>
 
-    <div class="md:col-span-8 lg:col-span-9 space-y-6">
-      <div class="space-y-2">
-        <div class="flex flex-wrap gap-2">
-          {#each bookData.genres as genre}
-            <span class="px-2.5 py-0.5 rounded-full text-xs font-medium bg-stone-200 dark:bg-stone-800 text-stone-700 dark:text-stone-300">
-              {genre}
-            </span>
-          {/each}
-        </div>
-        <h1 class="text-2xl sm:text-3xl lg:text-4xl font-serif font-bold text-stone-900 dark:text-stone-50 tracking-tight">
-          {bookData.title}
+    <div class="min-w-0">
+      <header>
+        <h1 class="text-balance font-serif text-3xl font-semibold leading-tight text-stone-900 sm:text-4xl dark:text-stone-50">
+          {book.title || 'Untitled'}
         </h1>
-        <p class="text-base font-medium text-stone-700 dark:text-stone-300">
-          by {bookData.authors.join(', ')}
+        {#if book.subtitle}
+          <p class="mt-1 text-lg text-stone-600 dark:text-stone-400">{book.subtitle}</p>
+        {/if}
+        <p class="mt-2 text-base text-stone-700 dark:text-stone-300">
+          by {book.authors.length > 0 ? book.authors.join(', ') : 'Unknown author'}
         </p>
-      </div>
 
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 shadow-xs">
-        <div class="flex flex-col justify-center items-center sm:items-start p-2 border-b sm:border-b-0 sm:border-r border-stone-100 dark:border-stone-800">
-          <div class="flex items-baseline gap-2">
-            <span class="text-4xl font-serif font-black text-stone-900 dark:text-stone-100">
-              {bookData.averageRating.toFixed(2)}
-            </span>
-            <span class="text-xs text-stone-400 font-mono">/ 5.0</span>
-          </div>
-          <RatingStars value={bookData.averageRating} readonly size="sm" />
-          <p class="text-xs text-stone-500 dark:text-stone-400 mt-2 font-mono">
-            {bookData.ratingsCount.toLocaleString()} community ratings
-          </p>
-          <div class="mt-1 flex items-center gap-1.5">
-            <span class="text-[11px] font-semibold text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/50 px-2 py-0.5 rounded border border-amber-200 dark:border-amber-800/50">
-              Bayesian Weighted: {bookData.bayesianRating.toFixed(2)}
-            </span>
-          </div>
-        </div>
+        {#if book.genres.length > 0}
+          <ul class="mt-3 flex flex-wrap gap-2">
+            {#each book.genres as genre (genre)}
+              <li>
+                <a
+                  href={`/search?genre=${encodeURIComponent(genre)}`}
+                  class="inline-flex rounded-[var(--radius-pill)] border border-stone-300 px-3 py-1 text-xs font-medium text-stone-700 hover:border-primary-400 hover:text-primary-800 focus-visible:outline-2 focus-visible:outline-offset-2 dark:border-stone-700 dark:text-stone-300 dark:hover:border-primary-500 dark:hover:text-primary-200"
+                >
+                  {genre}
+                </a>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </header>
 
-        <div class="flex flex-col justify-center space-y-1.5 p-2">
-          {#each [5, 4, 3, 2, 1] as star}
-            {@const count = bookData.ratingDistribution[star as 1|2|3|4|5] || 0}
-            {@const pct = bookData.ratingsCount > 0 ? (count / bookData.ratingsCount) * 100 : 0}
-            <div class="flex items-center text-xs gap-2">
-              <span class="w-3 text-right font-mono text-stone-500">{star}</span>
-              <div class="flex-1 h-2 bg-stone-100 dark:bg-stone-800 rounded-full overflow-hidden">
-                <div class="h-full bg-amber-500 rounded-full" style="width: {pct}%"></div>
-              </div>
-              <span class="w-10 text-right font-mono text-stone-400 text-[11px]">
-                {Math.round(pct)}%
-              </span>
-            </div>
-          {/each}
-        </div>
-      </div>
-
-      <div class="prose prose-stone dark:prose-invert max-w-none text-sm sm:text-base leading-relaxed">
-        <h3 class="text-sm font-sans font-semibold uppercase tracking-wider text-stone-400">Synopsis</h3>
-        <p>{bookData.description}</p>
-      </div>
-
-      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs border-y border-stone-200 dark:border-stone-800 py-3">
-        <div>
-          <span class="text-stone-400 block">Pages</span>
-          <span class="font-semibold text-stone-800 dark:text-stone-200 font-mono">{bookData.pageCount}</span>
-        </div>
-        <div>
-          <span class="text-stone-400 block">Published</span>
-          <span class="font-semibold text-stone-800 dark:text-stone-200">{bookData.publishedDate}</span>
-        </div>
-        <div>
-          <span class="text-stone-400 block">Publisher</span>
-          <span class="font-semibold text-stone-800 dark:text-stone-200 truncate block">{bookData.publisher}</span>
-        </div>
-        <div>
-          <span class="text-stone-400 block">ISBN</span>
-          <span class="font-semibold text-stone-800 dark:text-stone-200 font-mono">{bookData.isbn13}</span>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="space-y-6 pt-6 border-t border-stone-200 dark:border-stone-800">
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-      <div>
-        <h2 class="text-xl sm:text-2xl font-serif font-bold text-stone-900 dark:text-stone-100">
-          Community Reviews
-        </h2>
-        <p class="text-xs text-stone-500 font-mono mt-0.5">
-          {reviews.length} written thoughts from readers
-        </p>
-      </div>
-
-      {#if !isWritingReview}
-        <button
-          type="button"
-          class="min-h-[44px] px-5 py-2.5 bg-amber-600 hover:bg-amber-700 text-white font-medium text-xs sm:text-sm rounded-lg shadow-xs transition-colors self-start sm:self-auto active:scale-98"
-          onclick={() => (isWritingReview = true)}
-        >
-          Write a Review
-        </button>
+      {#if book.description}
+        <section class="mt-5" aria-labelledby="synopsis-heading">
+          <h2 id="synopsis-heading" class="font-serif text-lg font-semibold text-stone-900 dark:text-stone-100">Synopsis</h2>
+          <p class="mt-2 max-w-prose text-pretty leading-relaxed text-stone-700 dark:text-stone-300">{book.description}</p>
+        </section>
       {/if}
-    </div>
 
-    {#if isWritingReview}
-      <form
-        class="bg-white dark:bg-stone-900 p-5 rounded-xl border border-stone-300 dark:border-stone-700 shadow-md space-y-4"
-        onsubmit={(e) => { e.preventDefault(); submitReview(); }}
-      >
-        <div class="flex items-center justify-between">
-          <h3 class="font-serif font-bold text-lg">Your Review</h3>
-          <button
-            type="button"
-            class="text-stone-400 hover:text-stone-600 text-sm font-semibold p-1"
-            onclick={() => (isWritingReview = false)}
-          >
-            Cancel
-          </button>
-        </div>
+      <section class="mt-6 rounded-[var(--radius-card)] border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900" aria-labelledby="score-heading">
+        <h2 id="score-heading" class="font-serif text-lg font-semibold text-stone-900 dark:text-stone-100">
+          Community score
+        </h2>
 
-        <div>
-          <span class="block text-xs font-semibold text-stone-600 dark:text-stone-300 mb-1">
-            Rating
-          </span>
-          <RatingStars bind:value={reviewRating} size="md" />
-        </div>
-
-        <div>
-          <label for="review-title" class="block text-xs font-semibold text-stone-600 dark:text-stone-300 mb-1">
-            Review Headline
-          </label>
-          <input
-            id="review-title"
-            type="text"
-            required
-            bind:value={reviewTitle}
-            placeholder="Sum up your reading experience in a headline..."
-            class="w-full px-3 py-2 text-sm bg-stone-50 dark:bg-stone-800 border border-stone-300 dark:border-stone-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
-          />
-        </div>
-
-        <div>
-          <label for="review-content" class="block text-xs font-semibold text-stone-600 dark:text-stone-300 mb-1">
-            Review Content
-          </label>
-          <textarea
-            id="review-content"
-            required
-            rows="5"
-            bind:value={reviewContent}
-            placeholder="What resonated with you? Character development, pacing, style..."
-            class="w-full px-3 py-2 text-sm bg-stone-50 dark:bg-stone-800 border border-stone-300 dark:border-stone-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500 resize-y"
-          ></textarea>
-        </div>
-
-        <div class="flex items-center gap-2">
-          <input
-            id="spoiler-checkbox"
-            type="checkbox"
-            bind:checked={reviewSpoiler}
-            class="w-4 h-4 text-amber-600 rounded border-stone-300 focus:ring-amber-500"
-          />
-          <label for="spoiler-checkbox" class="text-xs text-stone-700 dark:text-stone-300">
-            This review contains plot spoilers
-          </label>
-        </div>
-
-        <div class="flex justify-end gap-3 pt-2">
-          <button
-            type="submit"
-            disabled={isSubmitting}
-            class="min-h-[44px] px-6 py-2 bg-stone-900 hover:bg-stone-800 dark:bg-amber-600 dark:hover:bg-amber-500 text-white font-semibold text-xs rounded-lg transition-colors disabled:opacity-50"
-          >
-            {isSubmitting ? 'Publishing...' : 'Publish Review'}
-          </button>
-        </div>
-      </form>
-    {/if}
-
-    <div class="space-y-4">
-      {#each reviews as review (review.id)}
-        <article class="p-5 bg-white dark:bg-stone-900 rounded-xl border border-stone-200 dark:border-stone-800/80 shadow-xs space-y-3">
-          <div class="flex items-start justify-between">
-            <div class="flex items-center gap-3">
-              <img
-                src={review.userAvatarUrl}
-                alt={review.userDisplayName}
-                class="w-9 h-9 rounded-full object-cover border border-stone-200 dark:border-stone-700"
-              />
-              <div>
-                <span class="block text-xs font-bold text-stone-900 dark:text-stone-100">
-                  {review.userDisplayName}
-                </span>
-                <span class="text-[11px] text-stone-400 font-mono">
-                  {new Date(review.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
-                </span>
-              </div>
-            </div>
-            <RatingStars value={review.rating} readonly size="sm" />
+        <div class="mt-3 grid gap-5 sm:grid-cols-[auto_1fr] sm:items-start">
+          <div>
+            <p class="flex items-baseline gap-2">
+              <span class="font-serif text-4xl font-semibold tabular-nums text-stone-900 dark:text-stone-50">
+                {formatRating(bayesianScore)}
+              </span>
+              <span class="text-sm text-stone-500 dark:text-stone-400">Bayesian score</span>
+            </p>
+            <p class="mt-1 text-sm text-stone-600 dark:text-stone-400">
+              {formatRating(simpleAverage)} simple average from {countLabel(ratingsCount, 'rating')}
+            </p>
+            <p class="mt-2 max-w-xs text-pretty text-xs text-stone-500 dark:text-stone-400">
+              {#if ratingsCount === 0}
+                No ratings yet, so the score sits at the catalog baseline until readers weigh in.
+              {:else if confidenceGap > 0.05}
+                Pulled {formatRating(confidenceGap)} below the raw average to discount for the small number of ratings.
+              {:else}
+                Close to the raw average because this title has enough ratings to be confident.
+              {/if}
+            </p>
           </div>
 
-          <h4 class="font-serif font-bold text-base text-stone-900 dark:text-stone-100">
-            {review.title}
-          </h4>
+          {#if distribution}
+            <RatingDistributionBar
+              {distribution}
+              totalOverride={ratingsCount}
+              title={`Rating distribution for ${book.title}`}
+            />
+          {/if}
+        </div>
+      </section>
 
-          <SpoilerGuard containsSpoilers={review.containsSpoilers}>
-            <p class="text-sm leading-relaxed text-stone-700 dark:text-stone-300 whitespace-pre-line">
-              {review.content}
+      <section class="mt-6 rounded-[var(--radius-card)] border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900" aria-labelledby="your-books-heading">
+        <h2 id="your-books-heading" class="font-serif text-lg font-semibold text-stone-900 dark:text-stone-100">
+          Your reading
+        </h2>
+
+        {#if !authState.user}
+          <p class="mt-2 text-sm text-stone-600 dark:text-stone-400">
+            Sign in to shelve this book, track your page, and rate it.
+          </p>
+          <Button variant="primary" size="sm" href="/profile" class="mt-3">Sign in</Button>
+        {:else}
+          <div class="mt-4 flex flex-col gap-5">
+            <div>
+              <p class="text-sm font-medium text-stone-700 dark:text-stone-300">Shelf</p>
+              <div class="mt-2 flex flex-wrap items-center gap-3">
+                <ShelfSelector
+                  bookId={book.id}
+                  bookTitle={book.title}
+                  currentStatus={shelf?.status ?? null}
+                  disabled={ratingPending}
+                  onSelect={(status) => changeShelf(status)}
+                />
+                {#if shelf}
+                  <span class="text-xs text-stone-500 dark:text-stone-400">
+                    Last updated {formatRelativeDate(shelf.updatedAt)}
+                  </span>
+                {/if}
+              </div>
+            </div>
+
+            <div>
+              <p class="text-sm font-medium text-stone-700 dark:text-stone-300">Your rating</p>
+              <div class="mt-2 flex flex-wrap items-center gap-3">
+                <RatingStars
+                  value={readerRating}
+                  showValue
+                  size="lg"
+                  label={`Your rating for ${book.title}`}
+                  disabled={ratingPending}
+                  onChange={(value) => void changeRating(value)}
+                />
+                {#if readerRating > 0}
+                  <span class="text-xs text-stone-500 dark:text-stone-400">
+                    {SHELF_STATUS_LABELS[shelf?.status ?? 'read']} · rated {formatRating(readerRating)}
+                  </span>
+                {/if}
+              </div>
+            </div>
+
+            {#if shelf && shelf.status !== 'want-to-read'}
+              <div>
+                <p class="text-sm font-medium text-stone-700 dark:text-stone-300">Progress</p>
+                <div class="mt-2 max-w-md">
+                  <ReadingProgressWidget
+                    bookId={book.id}
+                    pageCount={book.pageCount}
+                    bookTitle={book.title}
+                    currentPage={shelf.progressPages}
+                    disabled={ratingPending}
+                    onProgressChange={(pages) => changeProgress(pages)}
+                  />
+                </div>
+              </div>
+            {/if}
+          </div>
+        {/if}
+
+        {#if shelfFailure || ratingFailure}
+          <p class="mt-4 text-sm font-medium text-rose-700 dark:text-rose-300" role="alert">
+            {shelfFailure ?? ratingFailure}
+          </p>
+        {/if}
+      </section>
+
+      <section class="mt-6" aria-labelledby="reviews-heading">
+        <div class="flex flex-wrap items-end justify-between gap-3">
+          <div class="min-w-0">
+            <h2 id="reviews-heading" class="font-serif text-2xl font-semibold text-stone-900 dark:text-stone-50">
+              Reader reviews
+            </h2>
+            <p class="mt-1 text-sm text-stone-600 dark:text-stone-400">
+              {countLabel(reviews.length, 'review')} shown
+              {#if reviewsHasMore}of many more{/if}
             </p>
-          </SpoilerGuard>
-        </article>
-      {/each}
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <label class="text-sm text-stone-600 dark:text-stone-400" for={sortFieldId}>Sort</label>
+            <select
+              id={sortFieldId}
+              value={sortOption}
+              onchange={(event) => reviewStore.reorder(book.id, event.currentTarget.value as ReviewSortOption)}
+              class="h-11 rounded-[var(--radius-control)] border border-stone-300 bg-white px-3 text-sm text-stone-900 focus:border-primary-500 focus:outline-none focus-visible:outline-2 focus-visible:outline-offset-2 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-100"
+            >
+              {#each REVIEW_SORT_OPTIONS as option (option.value)}
+                <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
+
+            <Button variant={ownReview ? 'secondary' : 'primary'} size="sm" onclick={() => openComposer(ownReview ? 'edit' : 'create')}>
+              {ownReview ? 'Edit your review' : 'Write a review'}
+            </Button>
+          </div>
+        </div>
+
+        <div aria-live="polite" class="sr-only">{composerStatus ?? ''}</div>
+
+        {#if composerOpen}
+          <form
+            class="mt-4 rounded-[var(--radius-card)] border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900"
+            onsubmit={(event) => void submitReview(event)}
+            aria-labelledby={composerHeadingId}
+            novalidate
+          >
+            <h3 id={composerHeadingId} class="font-serif text-lg font-semibold text-stone-900 dark:text-stone-100">
+              {ownReview ? 'Edit your review' : `Review ${book.title}`}
+            </h3>
+
+            {#if !authState.user}
+              <p class="mt-2 text-sm text-stone-600 dark:text-stone-400">
+                Sign in to publish. Your text stays in this form.
+              </p>
+            {/if}
+
+            <div class="mt-4 flex flex-col gap-4">
+              <div>
+                <p class="text-sm font-medium text-stone-700 dark:text-stone-300">Rating</p>
+                <div class="mt-1">
+                  <RatingStars
+                    bind:value={draft.rating}
+                    showValue
+                    size="lg"
+                    label={`Rating for ${book.title}`}
+                  />
+                </div>
+              </div>
+
+              <div class="flex flex-col gap-1">
+                <label class="text-sm font-medium text-stone-700 dark:text-stone-300" for={titleFieldId}>
+                  Review title
+                </label>
+                <input
+                  id={titleFieldId}
+                  name="title"
+                  type="text"
+                  bind:value={draft.title}
+                  maxlength="120"
+                  autocomplete="off"
+                  spellcheck="true"
+                  placeholder="Summarise your take in a few words…"
+                  aria-describedby={composerError ? `${titleFieldId}-error` : undefined}
+                  class="h-11 w-full rounded-[var(--radius-control)] border border-stone-300 bg-white px-3 text-sm text-stone-900 placeholder:text-stone-400 focus:border-primary-500 focus:outline-none focus-visible:outline-2 focus-visible:outline-offset-2 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-100"
+                />
+              </div>
+
+              <div class="flex flex-col gap-1">
+                <label class="text-sm font-medium text-stone-700 dark:text-stone-300" for={contentFieldId}>
+                  Your review
+                </label>
+                <textarea
+                  id={contentFieldId}
+                  name="content"
+                  bind:value={draft.content}
+                  rows="6"
+                  maxlength="10000"
+                  spellcheck="true"
+                  placeholder="What worked, what did not, and who should read it…"
+                  class="w-full rounded-[var(--radius-control)] border border-stone-300 bg-white px-3 py-2 text-sm leading-relaxed text-stone-900 placeholder:text-stone-400 focus:border-primary-500 focus:outline-none focus-visible:outline-2 focus-visible:outline-offset-2 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-100"
+                ></textarea>
+                <p class="text-xs text-stone-500 dark:text-stone-400">
+                  {draft.content.trim().length} of 10,000 characters
+                </p>
+              </div>
+
+              <div class="flex items-start gap-3">
+                <input
+                  id={spoilerFieldId}
+                  name="containsSpoilers"
+                  type="checkbox"
+                  bind:checked={draft.containsSpoilers}
+                  class="mt-0.5 h-5 w-5 shrink-0 rounded border-stone-300 text-primary-600 focus-visible:outline-2 focus-visible:outline-offset-2 dark:border-stone-600"
+                />
+                <label class="text-sm text-stone-700 dark:text-stone-300" for={spoilerFieldId}>
+                  This review contains spoilers
+                  <span class="block text-xs text-stone-500 dark:text-stone-400">
+                    Spoiler reviews stay masked behind a reveal control.
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            {#if composerError}
+              <p id={`${titleFieldId}-error`} class="mt-3 text-sm font-medium text-rose-700 dark:text-rose-300" role="alert">
+                {composerError}
+              </p>
+            {/if}
+
+            <div class="mt-4 flex flex-wrap items-center gap-2">
+              <Button type="submit" variant="primary" size="sm" loading={isSubmittingReview}>
+                {#if isSubmittingReview}
+                  Saving…
+                {:else if ownReview}
+                  Save changes
+                {:else}
+                  Publish review
+                {/if}
+              </Button>
+              <Button type="button" variant="ghost" size="sm" disabled={isSubmittingReview} onclick={() => (composerOpen = false)}>
+                Cancel
+              </Button>
+              {#if ownReview}
+                {#if confirmDelete}
+                  <span class="ml-auto flex flex-wrap items-center gap-2 text-sm text-stone-600 dark:text-stone-400">
+                    Delete this review?
+                    <Button type="button" variant="danger" size="sm" loading={isDeletingReview} onclick={() => void deleteReview()}>
+                      Yes, delete
+                    </Button>
+                    <Button type="button" variant="ghost" size="sm" onclick={() => (confirmDelete = false)}>Keep it</Button>
+                  </span>
+                {:else}
+                  <Button type="button" variant="ghost" size="sm" class="ml-auto" onclick={() => (confirmDelete = true)}>
+                    Delete review
+                  </Button>
+                {/if}
+              {/if}
+            </div>
+          </form>
+        {/if}
+
+        {#if reviewsError}
+          <EmptyState tone="warning" title="Reviews could not be loaded" description={reviewsError} class="mt-4 py-8">
+            {#snippet action()}
+              <Button variant="primary" size="sm" onclick={() => void reviewStore.loadReviews(book.id, { refresh: true })}>
+                Try again
+              </Button>
+            {/snippet}
+          </EmptyState>
+        {:else if reviewsLoading && reviews.length === 0}
+          <div class="mt-4">
+            <CardGridSkeleton count={2} columns="rows" label="Loading reviews…" />
+          </div>
+        {:else if reviews.length === 0}
+          <EmptyState
+            title="No reviews yet"
+            description="Be the first to say what you thought. A few sentences is plenty."
+            class="mt-4 py-8"
+          >
+            {#snippet action()}
+              <Button variant={ownReview ? 'secondary' : 'primary'} size="sm" onclick={() => openComposer(ownReview ? 'edit' : 'create')}>
+                {ownReview ? 'Edit your review' : 'Write the first review'}
+              </Button>
+            {/snippet}
+          </EmptyState>
+        {:else}
+          <ul class="mt-4 flex flex-col gap-4">
+            {#each reviews as review (review.id)}
+              <li class="rounded-[var(--radius-card)] border border-stone-200 bg-white p-4 dark:border-stone-800 dark:bg-stone-900">
+                <article>
+                  <header class="flex flex-wrap items-start gap-3">
+                    <Avatar src={review.userAvatarUrl} alt="" name={review.userDisplayName} size="sm" />
+                    <div class="min-w-0 flex-1">
+                      <p class="truncate text-sm font-semibold text-stone-900 dark:text-stone-100">
+                        {review.userDisplayName || 'Reader'}
+                      </p>
+                      <p class="truncate font-mono text-xs text-stone-500 dark:text-stone-400">
+                        @{review.userHandle || 'reader'}
+                      </p>
+                    </div>
+                    <div class="flex flex-col items-end gap-1">
+                      <RatingStars value={review.rating} readonly size="sm" label={`${review.userDisplayName || 'Reader'} rated this ${formatRating(review.rating)}`} />
+                      <time datetime={review.createdAt} class="text-xs text-stone-500 dark:text-stone-400" title={formatDate(review.createdAt)}>
+                        {formatRelativeDate(review.createdAt)}
+                      </time>
+                    </div>
+                  </header>
+
+                  <div class="mt-3">
+                    <SpoilerGuard containsSpoilers={review.containsSpoilers}>
+                      <h3 class="font-serif text-lg font-semibold text-stone-900 dark:text-stone-100">
+                        {review.title || 'Untitled review'}
+                      </h3>
+                      <p class="mt-2 whitespace-pre-line text-pretty leading-relaxed text-stone-700 dark:text-stone-300">
+                        {review.content}
+                      </p>
+                    </SpoilerGuard>
+                  </div>
+
+                  {#if review.tags.length > 0}
+                    <ul class="mt-3 flex flex-wrap gap-2">
+                      {#each review.tags as tag (tag)}
+                        <li>
+                          <Badge tone="stone">{tag}</Badge>
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+
+                  <footer class="mt-3 flex flex-wrap items-center gap-4 text-xs text-stone-500 dark:text-stone-400">
+                    <span>{countLabel(review.likesCount, 'helpful vote')}</span>
+                    <span>{countLabel(review.commentsCount, 'comment')}</span>
+                    {#if ownReview?.id === review.id}
+                      <span class="font-medium text-primary-700 dark:text-primary-300">Your review</span>
+                    {/if}
+                  </footer>
+                </article>
+              </li>
+            {/each}
+          </ul>
+
+          {#if reviewsHasMore}
+            <div class="mt-4 flex justify-center">
+              <Button variant="secondary" size="md" loading={reviewsLoading} onclick={() => void reviewStore.loadMoreReviews(book.id)}>
+                {reviewsLoading ? 'Loading…' : 'Load more reviews'}
+              </Button>
+            </div>
+          {/if}
+        {/if}
+      </section>
     </div>
-  </section>
-</div>
+  </article>
+{/if}

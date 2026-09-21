@@ -16,6 +16,8 @@
  * Review counters on the book and on the reader's profile are maintained by the
  * gateway transaction, so they can never drift from the review documents.
  */
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+import { retryRead } from '$lib/data/retry';
 import {
   FirestoreReviewGateway,
   type ReviewGateway,
@@ -24,6 +26,7 @@ import {
 import {
   DuplicateReviewError,
   MutationInFlightError,
+  describeReadFailure,
   describeWriteFailure
 } from '$lib/data/errors';
 import { normalizeHandle } from '$lib/validation/schemas';
@@ -69,17 +72,17 @@ export function reviewIdFor(userId: string, bookId: string): string {
 
 export class ReviewStore {
   /** Reviews keyed by book id, in the book's current sort order. */
-  reviews = $state<Map<string, Review[]>>(new Map());
+  reviews = new SvelteMap<string, Review[]>();
   /** Sort option per book. */
-  sorts = $state<Map<string, ReviewSortOption>>(new Map());
+  sorts = new SvelteMap<string, ReviewSortOption>();
   /** True while a feed page is loading, per book. */
-  loading = $state<Set<string>>(new Set());
+  loading = new SvelteSet<string>();
   /** Book ids with a write in flight. */
-  pending = $state<Set<string>>(new Set());
+  pending = new SvelteSet<string>();
   /** Latest reader-facing failure per book id. */
-  failures = $state<Map<string, string>>(new Map());
+  failures = new SvelteMap<string, string>();
   /** Whether more feed pages exist, per book. */
-  more = $state<Map<string, boolean>>(new Map());
+  more = new SvelteMap<string, boolean>();
 
   #gateway: ReviewGateway;
   #currentUser: () => AuthUser | null;
@@ -140,12 +143,12 @@ export class ReviewStore {
   }
 
   clear(): void {
-    this.reviews = new Map();
-    this.sorts = new Map();
-    this.loading = new Set();
-    this.pending = new Set();
-    this.failures = new Map();
-    this.more = new Map();
+    this.reviews.clear();
+    this.sorts.clear();
+    this.loading.clear();
+    this.pending.clear();
+    this.failures.clear();
+    this.more.clear();
     this.#cursors = new Map();
   }
 
@@ -159,26 +162,26 @@ export class ReviewStore {
     const cursorId = refresh ? null : (this.#cursors.get(bookId) ?? null);
 
     this.sorts.set(bookId, sort);
-    this.loading = new Set(this.loading).add(bookId);
+    this.loading.add(bookId);
 
     try {
-      const page = await this.#gateway.listBookReviews({
-        bookId,
-        sort,
-        pageSize: this.#pageSize,
-        cursorId
-      });
+      const page = await retryRead(() =>
+        this.#gateway.listBookReviews({
+          bookId,
+          sort,
+          pageSize: this.#pageSize,
+          cursorId
+        })
+      );
 
       this.reviews.set(bookId, sortReviews(page.items, sort));
       this.#cursors.set(bookId, page.nextCursorId);
       this.more.set(bookId, page.hasMore);
       this.failures.delete(bookId);
     } catch (error) {
-      this.failures.set(bookId, describeWriteFailure(error, 'Reviews could not be loaded.'));
+      this.failures.set(bookId, describeReadFailure(error, 'Reviews could not be loaded.'));
     } finally {
-      const next = new Set(this.loading);
-      next.delete(bookId);
-      this.loading = next;
+      this.loading.delete(bookId);
     }
   }
 
@@ -189,25 +192,25 @@ export class ReviewStore {
 
     const existing = this.reviewsFor(bookId);
     const sort = this.sortFor(bookId);
-    this.loading = new Set(this.loading).add(bookId);
+    this.loading.add(bookId);
 
     try {
-      const page = await this.#gateway.listBookReviews({
-        bookId,
-        sort,
-        pageSize: this.#pageSize,
-        cursorId: cursor
-      });
+      const page = await retryRead(() =>
+        this.#gateway.listBookReviews({
+          bookId,
+          sort,
+          pageSize: this.#pageSize,
+          cursorId: cursor
+        })
+      );
 
       this.reviews.set(bookId, sortReviews([...existing, ...page.items], sort));
       this.#cursors.set(bookId, page.nextCursorId);
       this.more.set(bookId, page.hasMore);
     } catch (error) {
-      this.failures.set(bookId, describeWriteFailure(error, 'More reviews could not be loaded.'));
+      this.failures.set(bookId, describeReadFailure(error, 'More reviews could not be loaded.'));
     } finally {
-      const next = new Set(this.loading);
-      next.delete(bookId);
-      this.loading = next;
+      this.loading.delete(bookId);
     }
   }
 
@@ -333,7 +336,7 @@ export class ReviewStore {
   ): Promise<void> {
     if (this.pending.has(bookId)) throw new MutationInFlightError(subject);
 
-    this.pending = new Set(this.pending).add(bookId);
+    this.pending.add(bookId);
     this.failures.delete(bookId);
 
     plan.optimistic();
@@ -345,9 +348,7 @@ export class ReviewStore {
       this.failures.set(bookId, describeWriteFailure(error, 'That review change was reverted.'));
       throw error;
     } finally {
-      const next = new Set(this.pending);
-      next.delete(bookId);
-      this.pending = next;
+      this.pending.delete(bookId);
     }
   }
 

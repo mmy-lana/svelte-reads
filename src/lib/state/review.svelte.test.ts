@@ -238,7 +238,9 @@ describe('ReviewStore feeds', () => {
 
     await store.loadReviews(book.id, { refresh: true });
 
-    expect(store.failureFor(book.id)).toContain('permission');
+    // Reads report the read-oriented copy: nothing was rolled back, so the
+    // message asks the reader to sign in again instead of claiming a revert.
+    expect(store.failureFor(book.id)).toContain('Sign in again');
     expect(store.reviewsFor(book.id)).toEqual([cached]);
     expect(store.isLoading(book.id)).toBe(false);
   });

@@ -18,7 +18,8 @@ import {
   type CatalogGateway,
   type CatalogQuery
 } from '$lib/data/catalog-gateway';
-import { describeWriteFailure } from '$lib/data/errors';
+import { describeReadFailure } from '$lib/data/errors';
+import { retryRead } from '$lib/data/retry';
 import type { Book, BookSearchFilters, BookSortField, SortDirection } from '$lib/types/domain';
 import { DEFAULT_BOOK_SEARCH_FILTERS } from '$lib/types/domain';
 
@@ -218,7 +219,7 @@ export class SearchStore {
       this.hasMore = hasMore;
       this.serverPagesFetched = pages;
     } catch (error) {
-      this.error = describeWriteFailure(error, 'The catalog could not be loaded.');
+      this.error = describeReadFailure(error, 'The catalog could not be loaded.');
       this.results = [];
       this.hasMore = false;
     } finally {
@@ -240,7 +241,7 @@ export class SearchStore {
       this.hasMore = hasMore;
       this.serverPagesFetched += pages;
     } catch (error) {
-      this.error = describeWriteFailure(error, 'The next page could not be loaded.');
+      this.error = describeReadFailure(error, 'The next page could not be loaded.');
     } finally {
       this.isLoading = false;
       this.#flushPending();
@@ -300,7 +301,7 @@ export class SearchStore {
         cursorId
       };
 
-      const page = await this.#gateway.listBooks(query);
+      const page = await retryRead(() => this.#gateway.listBooks(query));
       pages += 1;
       guard += 1;
 

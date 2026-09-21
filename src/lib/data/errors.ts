@@ -120,6 +120,30 @@ export function describeWriteFailure(error: unknown, fallback: string): string {
   return fallback;
 }
 
+/**
+ * Translates a failed *read* into copy a reader can act on. Reads have nothing to
+ * roll back, so the message asks for a retry instead of claiming a revert — the
+ * write-oriented copy would be misleading on a catalog or feed failure.
+ */
+export function describeReadFailure(error: unknown, fallback: string): string {
+  if (error instanceof AuthenticationRequiredError) return 'Sign in to see this content.';
+  if (error instanceof DataIntegrityError) return error.message;
+
+  const code = readErrorCode(error);
+
+  if (code && OFFLINE_CODES.has(code)) {
+    return 'You appear to be offline. Reconnect and try again.';
+  }
+  if (code === 'permission-denied') {
+    return 'Your session may have expired. Sign in again to continue.';
+  }
+  if (code === 'not-found' || code === 'books/not-found') {
+    return 'That item is no longer available.';
+  }
+
+  return fallback;
+}
+
 /** True when an error represents a lost connection rather than a rejected write. */
 export function isOfflineError(error: unknown): boolean {
   const code = readErrorCode(error);
