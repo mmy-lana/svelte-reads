@@ -8,9 +8,9 @@ service firebase.storage {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
-    // Upload guard: a real image payload under the bucket ceiling.
+    // Upload guard: raster image payload under the bucket ceiling (rejects SVG scripts).
     function isImageUnder(maxBytes) {
-      return request.resource.contentType.matches('image/.*')
+      return request.resource.contentType.matches('image/(jpeg|png|webp|gif)')
         && request.resource.size <= maxBytes;
     }
 

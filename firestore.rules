@@ -91,10 +91,10 @@ service cloud.firestore {
         && request.resource.data.handle is string
         && request.resource.data.email is string
         && request.resource.data.stats is map
-        && isCount(request.resource.data.stats.reviewsCount)
-        && isCount(request.resource.data.stats.ratingsCount)
-        && isCount(request.resource.data.stats.booksReadCount)
-        && isCount(request.resource.data.stats.pagesReadTotal)
+        && request.resource.data.stats.reviewsCount == 0
+        && request.resource.data.stats.ratingsCount == 0
+        && request.resource.data.stats.booksReadCount == 0
+        && request.resource.data.stats.pagesReadTotal == 0
         && request.resource.data.get('avatarUrl', '') is string;
       allow update: if isOwner(userId)
         && request.resource.data.uid == userId
@@ -132,7 +132,26 @@ service cloud.firestore {
         && isRatingScore(request.resource.data.averageRating)
         && isRatingScore(request.resource.data.bayesianRating)
         && isCount(request.resource.data.ratingsCount)
-        && isCount(request.resource.data.reviewsCount);
+        && isCount(request.resource.data.reviewsCount)
+        && (
+          (
+            changedKeys().hasAny(['ratingDistribution', 'averageRating', 'ratingsCount', 'bayesianRating'])
+            && existsAfter(/databases/$(database)/documents/userShelves/$(request.auth.uid + '_' + bookId))
+          )
+          || (
+            changedKeys().hasOnly(['reviewsCount', 'updatedAt'])
+            && (
+              (
+                request.resource.data.reviewsCount == resource.data.reviewsCount + 1
+                && existsAfter(/databases/$(database)/documents/reviews/$(request.auth.uid + '_' + bookId))
+              )
+              || (
+                request.resource.data.reviewsCount == resource.data.reviewsCount - 1
+                && !existsAfter(/databases/$(database)/documents/reviews/$(request.auth.uid + '_' + bookId))
+              )
+            )
+          )
+        );
       allow delete: if false;
     }
 
@@ -190,10 +209,9 @@ service cloud.firestore {
         && request.resource.data.content is string
         && request.resource.data.content.size() >= 20
         && request.resource.data.content.size() <= 10000;
-      // Liking or unliking the review. The acting reader must have just created
-      // their own /reviewLikes row (or be removing the one they already own),
-      // and the counter may move by exactly one step — never by an arbitrary
-      // amount, and never together with any other review field.
+      // Liking or unliking the review. The acting reader must be creating
+      // their own /reviewLikes row in this commit (for +1) or removing it
+      // in this commit (for -1) atomically via existsAfter.
       allow update: if isAuthenticated()
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likesCount'])
         && request.resource.data.likesCount is number
@@ -201,11 +219,13 @@ service cloud.firestore {
         && (
           (
             request.resource.data.likesCount == resource.data.likesCount + 1
-            && exists(/databases/$(database)/documents/reviewLikes/$(reviewId + '_' + request.auth.uid))
+            && !exists(/databases/$(database)/documents/reviewLikes/$(reviewId + '_' + request.auth.uid))
+            && existsAfter(/databases/$(database)/documents/reviewLikes/$(reviewId + '_' + request.auth.uid))
           )
           || (
             request.resource.data.likesCount == resource.data.likesCount - 1
-            && !exists(/databases/$(database)/documents/reviewLikes/$(reviewId + '_' + request.auth.uid))
+            && exists(/databases/$(database)/documents/reviewLikes/$(reviewId + '_' + request.auth.uid))
+            && !existsAfter(/databases/$(database)/documents/reviewLikes/$(reviewId + '_' + request.auth.uid))
           )
         );
       allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
