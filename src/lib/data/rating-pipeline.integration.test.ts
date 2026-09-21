@@ -435,6 +435,25 @@ describe('review pipeline on the emulator', () => {
     // Deleting an absent review is a no-op rather than an error.
     await expect(reviewGateway.deleteReview(`${readerTwo.uid}_${bookId}`)).resolves.toBeUndefined();
   });
+
+  it('clamps reviewsCount to zero on delete even if counter was already zero (DATA-03)', async () => {
+    const zeroBookId = `${runId}-zero-reviews`;
+    await setDoc(doc(db, BOOK_COLLECTION, zeroBookId), {
+      ...emptyBook(zeroBookId),
+      reviewsCount: 0
+    });
+
+    const zeroReview = {
+      ...reviewDocument(zeroBookId),
+      id: `${readerTwo.uid}_${zeroBookId}`
+    };
+    await setDoc(doc(db, REVIEW_COLLECTION, zeroReview.id), zeroReview);
+
+    await expect(reviewGateway.deleteReview(zeroReview.id)).resolves.toBeUndefined();
+
+    const book = (await getDoc(doc(db, BOOK_COLLECTION, zeroBookId))).data() as Book;
+    expect(book.reviewsCount).toBe(0);
+  });
 });
 
 // DATA-01: deleting a review must not strand the engagement that pointed at it.

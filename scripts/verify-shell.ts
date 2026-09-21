@@ -93,7 +93,7 @@ async function visibleState(session: CdpSession): Promise<string> {
     session,
     `(() => {
       const node = document.querySelector('main [role="alert"], main [role="status"]');
-      const text = node?.textContent?.replace(/\s+/g, ' ').trim() ?? 'none';
+      const text = node?.textContent?.replace(/\\s+/g, ' ').trim() ?? 'none';
       return text.slice(0, 120);
     })()`
   );
@@ -573,7 +573,7 @@ async function verifyDataSurfaces(session: CdpSession): Promise<void> {
       alert:
         document
           .querySelector('section[aria-labelledby="reviews-heading"] [role="alert"]')
-          ?.textContent?.replace(/\s+/g, ' ')
+          ?.textContent?.replace(/\\s+/g, ' ')
           .trim()
           .slice(0, 90) ?? null,
       requests: performance

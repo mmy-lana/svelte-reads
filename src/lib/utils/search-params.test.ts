@@ -137,6 +137,32 @@ describe('applySearchParams (PERF-01)', () => {
       vi.useRealTimers();
     }
   });
+
+  it('delegates to applyFilters when the applier supports atomic batching (PERF-02)', () => {
+    const applyFilters = vi.fn();
+    const applier = {
+      setQuery: vi.fn(),
+      setGenre: vi.fn(),
+      setMinRating: vi.fn(),
+      setSortOption: vi.fn(),
+      applyFilters
+    };
+
+    applySearchParams(
+      new URLSearchParams('q=dune&genre=Science+Fiction&rating=4&sort=title&dir=asc'),
+      applier
+    );
+
+    expect(applyFilters).toHaveBeenCalledTimes(1);
+    expect(applyFilters).toHaveBeenCalledWith({
+      query: 'dune',
+      genre: 'Science Fiction',
+      minRating: 4,
+      sortBy: 'title',
+      sortDirection: 'asc'
+    });
+    expect(applier.setQuery).not.toHaveBeenCalled();
+  });
 });
 
 describe('SearchStore debounce is the single ceiling (PERF-01)', () => {
