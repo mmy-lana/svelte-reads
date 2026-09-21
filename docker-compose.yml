@@ -1,0 +1,28 @@
+services:
+  firebase-emulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.emulator
+    container_name: bookreview-firebase-emulator
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+      - "8080:8080"
+      - "9099:9099"
+      - "9199:9199"
+    environment:
+      - GCP_PROJECT=book-review-community-dev
+    volumes:
+      - ./firebase.json:/opt/workspace/firebase.json:ro
+      - ./firestore.rules:/opt/workspace/firestore.rules:ro
+      - emulator-cache:/root/.cache
+    networks:
+      - app-net
+
+volumes:
+  emulator-cache:
+    driver: local
+
+networks:
+  app-net:
+    driver: bridge
