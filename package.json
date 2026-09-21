@@ -16,6 +16,7 @@
     "test:emulator": "vitest run --config vitest.emulator.config.ts",
     "verify": "pnpm run check && pnpm run test && pnpm run build",
     "verify:atoms": "node scripts/verify-atoms.ts",
+    "verify:molecules": "node scripts/verify-molecules.ts",
     "emulator:up": "docker compose up -d --build",
     "emulator:down": "docker compose down",
     "emulator:logs": "docker compose logs -f firebase-emulator",

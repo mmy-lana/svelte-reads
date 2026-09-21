@@ -1,116 +1,272 @@
 <script lang="ts">
+  import { tick } from 'svelte';
+  import {
+    SHELF_STATUS_LABELS,
+    SHELF_STATUS_SHORT_LABELS,
+    SHELF_STATUS_TONES,
+    SHELF_STATUS_VALUES
+  } from '$lib/utils/shelf-state-machine';
+  import { cx } from '$lib/utils/cx';
   import type { ShelfStatus } from '$lib/types/domain';
 
+  /**
+   * Shelf picker with no hover dependency: below 768px it opens as a bottom
+   * sheet, at and above 768px it becomes a popover anchored to the trigger.
+   * Both variants render the same listbox, so keyboard and screen-reader
+   * behaviour is identical across viewports.
+   */
   interface Props {
     bookId: string;
+    /** Optional title used for the sheet heading and the listbox label. */
+    bookTitle?: string;
     currentStatus?: ShelfStatus | null;
-    onSelect?: (status: ShelfStatus) => Promise<void>;
+    disabled?: boolean;
+    /** Receives the requested status; rejection surfaces an inline error. */
+    onSelect?: (status: ShelfStatus) => void | Promise<void>;
+    class?: string;
   }
 
-  let { bookId, currentStatus = null, onSelect }: Props = $props();
+  let {
+    bookId,
+    bookTitle,
+    currentStatus = null,
+    disabled = false,
+    onSelect,
+    class: className = ''
+  }: Props = $props();
+
+  const DOT_CLASSES = {
+    sky: 'bg-sky-500',
+    amber: 'bg-amber-500',
+    emerald: 'bg-emerald-500',
+    stone: 'bg-stone-400'
+  } as const;
+
+  /** Stable per-instance id so the trigger can reference the panel. */
+  const panelId = $props.id();
 
   let isOpen = $state(false);
   let isUpdating = $state(false);
+  let errorMessage = $state<string | null>(null);
+  let triggerElement: HTMLButtonElement | null = $state(null);
+  let panelElement: HTMLDivElement | null = $state(null);
 
-  const shelfOptions: { label: string; value: ShelfStatus }[] = [
-    { label: 'Want to Read', value: 'want-to-read' },
-    { label: 'Currently Reading', value: 'currently-reading' },
-    { label: 'Read', value: 'read' },
-    { label: 'Did Not Finish', value: 'did-not-finish' }
-  ];
+  const triggerLabel = $derived(
+    currentStatus ? SHELF_STATUS_SHORT_LABELS[currentStatus] : 'Add to Shelf'
+  );
 
-  async function handleSelection(status: ShelfStatus) {
+  const isBusy = $derived(disabled || isUpdating);
+
+  const triggerClasses = $derived(
+    cx(
+      'flex w-full select-none items-center justify-between gap-2 rounded-[var(--radius-control)] border px-3 text-xs font-semibold touch-manipulation',
+      'min-h-11 transition-[background-color,border-color,color] duration-150 ease-out',
+      'focus-visible:outline-2 focus-visible:outline-offset-2',
+      'disabled:pointer-events-none disabled:opacity-60',
+      currentStatus
+        ? 'border-primary-300 bg-primary-50 text-primary-900 dark:border-primary-800/60 dark:bg-primary-950/40 dark:text-primary-100'
+        : 'border-stone-300 bg-stone-100 text-stone-700 hover:bg-stone-200 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-200 dark:hover:bg-stone-700'
+    )
+  );
+
+  const panelClasses =
+    'fixed inset-x-0 bottom-0 z-50 mx-auto w-full max-w-lg overflow-hidden rounded-t-[var(--radius-card)] border border-stone-200 bg-white pb-[env(safe-area-inset-bottom)] shadow-elevation-4 animate-rise dark:border-stone-800 dark:bg-stone-900 md:absolute md:inset-x-auto md:bottom-auto md:right-0 md:top-full md:mt-1.5 md:w-72 md:max-w-none md:rounded-[var(--radius-card)] md:pb-1 md:animate-fade-in';
+
+  function optionElements(): HTMLButtonElement[] {
+    if (!panelElement) return [];
+    return Array.from(panelElement.querySelectorAll<HTMLButtonElement>('[role="option"]'));
+  }
+
+  async function open(): Promise<void> {
+    if (isBusy) return;
+    errorMessage = null;
+    isOpen = true;
+    await tick();
+
+    const options = optionElements();
+    const selected = options.find((option) => option.getAttribute('aria-selected') === 'true');
+    (selected ?? options[0])?.focus();
+  }
+
+  function close(): void {
+    if (!isOpen) return;
+    isOpen = false;
+    triggerElement?.focus({ preventScroll: true });
+  }
+
+  async function select(status: ShelfStatus): Promise<void> {
     if (status === currentStatus) {
-      isOpen = false;
+      close();
       return;
     }
+
     isUpdating = true;
+    errorMessage = null;
+
     try {
-      if (onSelect) {
-        await onSelect(status);
-      }
-    } finally {
+      await onSelect?.(status);
       isUpdating = false;
-      isOpen = false;
+      close();
+    } catch {
+      isUpdating = false;
+      errorMessage = `Could not move "${bookTitle ?? 'this book'}" to ${SHELF_STATUS_LABELS[status]}. Check your connection and try again.`;
     }
   }
 
-  function getButtonLabel(status: ShelfStatus | null): string {
-    switch (status) {
-      case 'want-to-read': return 'Want to Read';
-      case 'currently-reading': return 'Reading';
-      case 'read': return 'Finished';
-      case 'did-not-finish': return 'DNF';
-      default: return 'Add to Shelf';
+  function handleWindowKeyDown(event: KeyboardEvent): void {
+    if (isOpen && event.key === 'Escape') {
+      event.preventDefault();
+      close();
+    }
+  }
+
+  function handlePanelKeyDown(event: KeyboardEvent): void {
+    const options = optionElements();
+    if (options.length === 0) return;
+
+    const activeIndex = options.indexOf(document.activeElement as HTMLButtonElement);
+
+    switch (event.key) {
+      case 'ArrowDown':
+      case 'ArrowUp': {
+        event.preventDefault();
+        const delta = event.key === 'ArrowDown' ? 1 : -1;
+        const nextIndex = activeIndex < 0 ? 0 : (activeIndex + delta + options.length) % options.length;
+        options[nextIndex]?.focus();
+        break;
+      }
+      case 'Home':
+        event.preventDefault();
+        options[0]?.focus();
+        break;
+      case 'End':
+        event.preventDefault();
+        options[options.length - 1]?.focus();
+        break;
+      default:
+        break;
     }
   }
 </script>
 
-<div class="relative inline-block w-full">
+<svelte:window onkeydown={handleWindowKeyDown} />
+
+<div class={cx('relative w-full', className)}>
   <button
+    bind:this={triggerElement}
     type="button"
-    class="w-full min-h-[44px] flex items-center justify-between px-3 py-2 text-xs font-semibold rounded-lg transition-colors border shadow-xs select-none disabled:opacity-50 disabled:pointer-events-none {currentStatus
-      ? 'bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 border-amber-300 dark:border-amber-800/60'
-      : 'bg-stone-100 dark:bg-stone-800 text-stone-700 dark:text-stone-300 border-stone-300 dark:border-stone-700 hover:bg-stone-200 dark:hover:bg-stone-700'}"
-    onclick={() => (isOpen = !isOpen)}
-    aria-expanded={isOpen}
+    class={triggerClasses}
+    disabled={isBusy}
     aria-haspopup="listbox"
+    aria-expanded={isOpen}
+    aria-controls={panelId}
+    onclick={() => (isOpen ? close() : void open())}
   >
-    <span class="truncate">
-      {#if isUpdating}
-        Updating...
-      {:else}
-        {getButtonLabel(currentStatus)}
+    <span class="flex min-w-0 items-center gap-1.5">
+      {#if currentStatus}
+        <span
+          class={cx('h-1.5 w-1.5 shrink-0 rounded-full', DOT_CLASSES[SHELF_STATUS_TONES[currentStatus]])}
+          aria-hidden="true"
+        ></span>
       {/if}
+      <span class="truncate">{isUpdating ? 'Updating…' : triggerLabel}</span>
     </span>
-    <svg
-      class="w-4 h-4 ml-1.5 transition-transform duration-200 {isOpen ? 'rotate-180' : ''}"
-      viewBox="0 0 20 20"
-      fill="currentColor"
-    >
-      <path
-        fill-rule="evenodd"
-        d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"
-        clip-rule="evenodd"
-      />
-    </svg>
+
+    {#if isUpdating}
+      <svg class="h-4 w-4 shrink-0 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25" />
+        <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+      </svg>
+    {:else}
+      <svg
+        class={cx('h-4 w-4 shrink-0 transition-transform duration-200', isOpen && 'rotate-180')}
+        viewBox="0 0 20 20"
+        fill="currentColor"
+        aria-hidden="true"
+      >
+        <path
+          fill-rule="evenodd"
+          d="M5.293 7.293a1 1 0 0 1 1.414 0L10 10.586l3.293-3.293a1 1 0 1 1 1.414 1.414l-4 4a1 1 0 0 1-1.414 0l-4-4a1 1 0 0 1 0-1.414Z"
+          clip-rule="evenodd"
+        />
+      </svg>
+    {/if}
   </button>
 
   {#if isOpen}
-    <div
-      class="fixed inset-0 z-40"
-      onclick={() => (isOpen = false)}
-      onkeydown={(e) => e.key === 'Escape' && (isOpen = false)}
-      role="presentation"
-      tabindex="-1"
-    ></div>
+    <!-- Click-away layer; keep it behind the panel and out of the tab order. -->
+    <div class="fixed inset-0 z-40" role="presentation" onclick={close}></div>
 
-    <ul
+    <div
+      bind:this={panelElement}
+      id={panelId}
+      class={panelClasses}
       role="listbox"
-      class="absolute left-0 bottom-full mb-1 sm:bottom-auto sm:top-full sm:mt-1 z-50 w-full bg-white dark:bg-stone-900 rounded-lg shadow-xl border border-stone-200 dark:border-stone-800 py-1 overflow-hidden"
+      tabindex="-1"
+      aria-label={bookTitle ? `Shelf for ${bookTitle}` : 'Choose a shelf'}
+      onkeydown={handlePanelKeyDown}
     >
-      {#each shelfOptions as option}
-        <li role="option" aria-selected={currentStatus === option.value}>
-          <button
-            type="button"
-            class="w-full text-left px-3.5 py-2.5 text-xs font-medium transition-colors flex items-center justify-between {currentStatus === option.value
-              ? 'bg-amber-500/10 text-amber-900 dark:text-amber-200 font-semibold'
-              : 'text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'}"
-            onclick={() => handleSelection(option.value)}
-          >
-            <span>{option.label}</span>
-            {#if currentStatus === option.value}
-              <svg class="w-4 h-4 text-amber-600 dark:text-amber-400" viewBox="0 0 20 20" fill="currentColor">
-                <path
-                  fill-rule="evenodd"
-                  d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-                  clip-rule="evenodd"
-                />
-              </svg>
-            {/if}
-          </button>
-        </li>
-      {/each}
-    </ul>
+      <div class="mx-auto mt-2 h-1 w-10 rounded-full bg-stone-300 md:hidden dark:bg-stone-700"></div>
+
+      <p
+        class="px-4 pt-3 pb-1 font-serif text-sm font-semibold text-stone-900 md:px-3 md:pt-2.5 md:text-[11px] md:font-sans md:font-bold md:uppercase md:tracking-wide md:text-stone-500 dark:text-stone-100 md:dark:text-stone-400"
+      >
+        {bookTitle ? 'Move to Shelf' : 'Add to Shelf'}
+      </p>
+
+      <ul class="pb-1 md:pb-0.5">
+        {#each SHELF_STATUS_VALUES as status (status)}
+          <li role="none">
+            <button
+              type="button"
+              role="option"
+              aria-selected={currentStatus === status}
+              disabled={isUpdating}
+              class={cx(
+                'flex w-full min-h-12 items-center justify-between gap-3 px-4 text-left text-sm transition-colors md:min-h-11 md:px-3 md:text-xs',
+                'disabled:pointer-events-none disabled:opacity-60',
+                currentStatus === status
+                  ? 'bg-primary-50 font-semibold text-primary-900 dark:bg-primary-950/40 dark:text-primary-100'
+                  : 'text-stone-700 hover:bg-stone-100 active:bg-stone-200 dark:text-stone-200 dark:hover:bg-stone-800'
+              )}
+              onclick={() => void select(status)}
+            >
+              <span class="flex min-w-0 items-center gap-2.5">
+                <span
+                  class={cx('h-2 w-2 shrink-0 rounded-full', DOT_CLASSES[SHELF_STATUS_TONES[status]])}
+                  aria-hidden="true"
+                ></span>
+                <span class="truncate">{SHELF_STATUS_LABELS[status]}</span>
+              </span>
+
+              {#if currentStatus === status}
+                <svg
+                  class="h-4 w-4 shrink-0 text-primary-600 dark:text-primary-400"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                  aria-hidden="true"
+                >
+                  <path
+                    fill-rule="evenodd"
+                    d="M16.707 5.293a1 1 0 0 1 0 1.414l-8 8a1 1 0 0 1-1.414 0l-4-4a1 1 0 0 1 1.414-1.414L8 12.586l7.293-7.293a1 1 0 0 1 1.414 0Z"
+                    clip-rule="evenodd"
+                  />
+                </svg>
+              {/if}
+            </button>
+          </li>
+        {/each}
+      </ul>
+
+      <div class="border-t border-stone-200 px-4 py-2 md:px-3 dark:border-stone-800">
+        {#if errorMessage}
+          <p class="text-xs text-rose-700 dark:text-rose-300" role="alert">{errorMessage}</p>
+        {:else}
+          <p class="text-[11px] text-stone-500 dark:text-stone-400">
+            Updates apply immediately to your shelves.
+          </p>
+        {/if}
+      </div>
+    </div>
   {/if}
 </div>
