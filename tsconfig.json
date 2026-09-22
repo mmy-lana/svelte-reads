@@ -9,6 +9,15 @@
     "skipLibCheck": true,
     "sourceMap": true,
     "strict": true,
-    "moduleResolution": "bundler"
-  }
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": [
+    ".svelte-kit/ambient.d.ts",
+    ".svelte-kit/non-ambient.d.ts",
+    "./src/**/*",
+    "./scripts/**/*"
+  ]
 }

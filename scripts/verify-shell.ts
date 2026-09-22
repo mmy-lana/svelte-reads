@@ -22,6 +22,8 @@
  *   pnpm run verify:shell -- --url=...     # custom base URL
  *   pnpm run verify:shell -- --shots=<dir> # also write screenshots
  */
+/// <reference types="node" />
+
 import {
   VIEWPORTS,
   captureScreenshot,
