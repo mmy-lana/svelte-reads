@@ -93,7 +93,7 @@ Shelf mutations are governed by pure state transitions:
 
 ### 1. Clone & Install
 ```bash
-git clone https://github.com/your-username/svelte-reads.git
+git clone https://github.com/mmy-lana/svelte-reads.git
 cd svelte-reads
 pnpm install
 ```
